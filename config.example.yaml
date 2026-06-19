@@ -1,0 +1,20 @@
+sftp:
+  host: "sftp.example.com"
+  port: 22
+  username: "myuser"
+  # password from env: SFTP_PASSWORD
+
+s3:
+  bucket: "my-migration-bucket"
+  prefix: ""                          # optional prefix for all S3 keys
+  region: "us-east-1"
+  tracking_prefix: "migration-tracking"  # where tracking JSONs go in S3
+
+options:
+  max_workers: 4                      # concurrent transfer threads per folder
+  multipart_threshold_mb: 100         # use multipart upload above this size
+  multipart_chunk_mb: 16              # chunk size for multipart
+  max_retries: 3                      # retry count per file
+  retry_backoff_base: 2               # exponential backoff base (seconds)
+  consecutive_failure_threshold: 5    # halt program if N files fail in a row
+  log_file: "logs/migrator.log"       # relative to deployment folder (null to disable)
