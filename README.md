@@ -14,15 +14,30 @@ Designed for deployment on **air-gapped midman servers** with network access lim
 
 ## Features
 
-- **Infinite Scale Database Tracking** — backed by an ultra-fast local SQLite database instead of in-memory JSON to support tens of millions of files.
-- **Daemon Scheduler** — running `./run.sh` launches the persistent Daemon by default. It reads standard cron schedules directly from `folders.txt` and manages its own internal triggers via a SQLite scheduling database.
-- **Strict Mirror Sync** — automatically deletes orphaned S3 files that were removed from the SFTP server, keeping the destination perfectly in sync.
-- **Streaming SFTP Generator** — pulls file metadata over the network one-by-one, keeping memory usage flat regardless of folder size.
+- **Database Tracking** — backed by local SQLite database to support large scale migration.
+- **Daemon Scheduler** — running `./run.sh` launches the persistent scheduler. It reads standard cron schedules directly from `folders.txt` and manages its own internal triggers via a SQLite scheduling database.
+- **Strict Mirror Sync** — automatically deletes files on S3 that were removed from the SFTP server, keeping the destination perfectly in sync.
+- **Streaming SFTP Generator** — pulls file metadata from SFTP server over the network one-by-one, keeping memory usage flat regardless of folder size.
 - **Stream-based transfer** — files are streamed directly from SFTP to S3 without touching local disk.
 - **Concurrent transfers** — configurable thread pool for parallel file uploads within each folder.
 - **Multipart uploads** — automatic for files larger than a configurable threshold (default: 100 MB).
 - **Smart change detection** — skips files that haven't changed (size + mtime comparison).
 - **Stateless Resilience** — tracking history is downloaded from S3 at the start, making the midman server completely disposable.
+
+## How It Scales
+
+This migrator is specifically engineered to handle extreme scaling scenarios without crashing:
+
+### 1. Handling a Large Number of Files (Millions of files)
+Standard scripts often crash on massive directories due to Out of Memory (OOM) errors. This migrator avoids that by using:
+- **SFTP Generators**: Instead of loading the entire list of files into a giant array at once, it uses a Python generator to pull file names from the SFTP server one by one. 
+- **SQLite Tracking**: It queries a highly optimized local SQLite database to check if a file has already been transferred, instead of keeping a massive dictionary in memory. 
+*Result: Memory usage stays completely flat whether you are transferring 10 files or 10 million files.*
+
+### 2. Handling Massive Individual Files (e.g., 50GB+ files)
+Standard scripts will often run out of hard drive space or timeout on huge files. This migrator handles it by:
+- **Zero Disk Usage**: Data is streamed directly from the SFTP server straight into AWS S3. The file payload is never saved to the local server's hard drive.
+- **Multipart Chunking**: For any file larger than 100MB, the migrator automatically switches to S3 Multipart Uploads. It reads the file in tiny 16MB chunks, holds just that one chunk in memory, uploads it to S3, and repeats until finished.
 
 ## Prerequisites
 
@@ -127,6 +142,46 @@ export AWS_SECRET_ACCESS_KEY=xxx
 ./run.sh --log-level DEBUG
 ```
 
+## Running as a System Service (systemd)
+
+To ensure the migrator runs continuously in the background and starts automatically on system reboot, you can configure it as a `systemd` service on Linux.
+
+1. Create an environment file at `/opt/migrator/.env` with your credentials:
+```bash
+SFTP_PASSWORD=your_sftp_password
+AWS_ACCESS_KEY_ID=your_aws_key
+AWS_SECRET_ACCESS_KEY=your_aws_secret
+```
+*(Run `chmod 600 /opt/migrator/.env` to protect your secrets.)*
+
+2. Create a service file at `/etc/systemd/system/migrator.service` (requires `sudo`):
+```ini
+[Unit]
+Description=SFTP-to-S3 Migrator Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=your_user  # Change this to your deployment username
+WorkingDirectory=/opt/migrator
+ExecStart=/opt/migrator/run.sh
+Restart=always
+RestartSec=10
+EnvironmentFile=/opt/migrator/.env
+
+[Install]
+WantedBy=multi-user.target
+```
+
+3. Enable and start the service:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable migrator.service
+sudo systemctl start migrator.service
+```
+
+You can view the logs anytime using `journalctl -u migrator.service -f` or by checking the local `logs/migrator.log` file.
+
 ## How It Works
 
 ### Per-Folder Lifecycle
@@ -165,6 +220,20 @@ Check `s3://bucket/migration-tracking/*.db` to monitor progress. You can downloa
 ├── tracking/           ← ephemeral tracking SQLite DBs
 └── logs/               ← log files
 ```
+
+## Codebase Structure for Developers
+
+If you are a junior developer or simply looking to understand, modify, or extend the logic of the codebase, here is a breakdown of the core modules located in `src/migrator/`:
+
+- `__main__.py`: The entry point. Parses CLI arguments (`--folder`, `--dry-run`) and launches either a single directory run or the persistent daemon scheduler.
+- `scheduler.py`: The daemon scheduler. Uses a local SQLite database to manage cron jobs and one-time tasks, triggering folder transfers when scheduled.
+- `transfer.py`: The core orchestrator. Contains the business logic for concurrency, consuming the SFTP generator, batching uploads, and deleting orphaned files on S3.
+- `s3_client.py`: AWS Boto3 wrapper. Handles multipart chunking, credentials validation, and uploading the binary SQLite tracking databases.
+- `sftp_client.py`: Paramiko wrapper. Connects to SFTP and recursively walks directories using generators to ensure memory usage remains flat regardless of folder depth.
+- `manifest.py`: SQLite wrapper. Tracks local file states (`seen`, `size`, `mtime`) to ensure we only transfer new or changed files. Replaces in-memory JSON to guarantee infinite horizontal scale.
+- `config.py`: Parses `config.yaml`, validates crontab expressions, and securely loads environment variables.
+
+**Design Philosophy**: The codebase favors functional programming paradigms (pure functions, callbacks) over stateful class OOP. State is explicitly passed around via context dataclasses (`S3Context`, `SFTPContext`) to avoid mutating class instance variables.
 
 ## Troubleshooting
 
