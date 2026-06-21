@@ -6,9 +6,10 @@
 #   export SFTP_PASSWORD=xxx
 #   export AWS_ACCESS_KEY_ID=xxx
 #   export AWS_SECRET_ACCESS_KEY=xxx
-#   ./run.sh                          # full migration
-#   ./run.sh --dry-run                # preview mode
-#   ./run.sh --log-level DEBUG        # verbose logging
+#   ./run.sh                          # Starts the daemon scheduler (default)
+#   ./run.sh --folder /path           # Run manually on a single folder and exit
+#   ./run.sh --dry-run                # Preview mode
+#   ./run.sh --log-level DEBUG        # Verbose logging
 
 set -euo pipefail
 

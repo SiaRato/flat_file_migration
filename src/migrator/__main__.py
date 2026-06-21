@@ -3,6 +3,7 @@
 Usage:
     python -m migrator --config config.yaml --folders folders.txt
     python -m migrator --dry-run
+    python -m migrator --folder /path/to/specific
     python -m migrator --log-level DEBUG
 """
 
@@ -12,7 +13,6 @@ import sys
 
 from migrator.config import AppConfig, ConfigError, load_config
 from migrator.logging_config import setup_logging
-from migrator.transfer import run_migration
 
 
 def main() -> int:
@@ -30,6 +30,11 @@ def main() -> int:
         "--folders",
         default="folders.txt",
         help="Path to folders list file (default: folders.txt)",
+    )
+    parser.add_argument(
+        "--folder",
+        default=None,
+        help="Override folders.txt and run on a single specific folder once",
     )
     parser.add_argument(
         "--dry-run",
@@ -55,7 +60,7 @@ def main() -> int:
 
     # Load config first (before logging, since config has log_file setting)
     try:
-        config = load_config(config_path, folders_path, base_dir)
+        config = load_config(config_path, folders_path, base_dir, args.folder)
     except ConfigError as e:
         # Can't use logger yet — print to stderr
         print(f"FATAL: Configuration error: {e}", file=sys.stderr)
@@ -80,19 +85,49 @@ def main() -> int:
     )
     logger.info("Folders to process: %d", len(config.folders))
 
-    # Run migration
-    exit_code = run_migration(
-        config=config,
-        folders_path=folders_path,
-        dry_run=args.dry_run,
-    )
-
-    if exit_code == 0:
-        logger.info("Migration completed successfully")
-    elif exit_code == 1:
-        logger.warning("Migration completed with some failures")
+    if args.folder:
+        from migrator.s3_client import create_s3_context, S3AuthError
+        from migrator.transfer import _process_folder, _resolve_tracking_dir, MigrationStats, FatalMigrationError
+        import time
+        
+        # Single folder override mode
+        try:
+            s3_ctx = create_s3_context(config.s3)
+        except S3AuthError as e:
+            logger.critical("FATAL: S3 authentication failed: %s", e)
+            return 2
+            
+        tracking_dir = _resolve_tracking_dir(config.base_dir)
+        multipart_threshold = config.options.multipart_threshold_mb * 1024 * 1024
+        stats = MigrationStats(start_time=time.time())
+        
+        try:
+            _process_folder(
+                folder=args.folder,
+                config=config,
+                s3_ctx=s3_ctx,
+                tracking_dir=tracking_dir,
+                folders_path=folders_path,
+                multipart_threshold=multipart_threshold,
+                dry_run=args.dry_run,
+                stats=stats,
+            )
+            exit_code = 0 if stats.failed == 0 else 1
+            logger.info("Manual folder override completed")
+            print(stats.summary())
+        except FatalMigrationError as e:
+            logger.critical("FATAL: %s", e)
+            print(stats.summary())
+            exit_code = 2
+            
     else:
-        logger.critical("Migration halted due to fatal error")
+        # Default behavior: run the daemon scheduler
+        from migrator.scheduler import run_daemon
+        exit_code = run_daemon(
+            config=config,
+            folders_path=folders_path,
+            dry_run=args.dry_run,
+        )
 
     return exit_code
 

@@ -1,36 +1,47 @@
-"""Transfer orchestrator.
+"""Transfer orchestrator (Functional).
 
 Coordinates the folder-by-folder migration lifecycle:
     1. Upload 'in_progress' tracking to S3
-    2. Migrate files concurrently (SFTP → S3 streaming)
+    2. Migrate files concurrently (SFTP → S3 streaming) using Map/Reduce
     3. Upload 'completed' or 'failed' tracking to S3
     4. Clean up local tracking + mark folder done
 """
 
 import logging
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
-from migrator.config import AppConfig, SFTPConfig, mark_folder_done
+from migrator.config import AppConfig, SFTPConfig
+from migrator.types import S3Context, SFTPContext, ManifestContext
+from migrator.s3_client import S3AuthError, S3UploadError, upload_tracking_db, upload_stream, delete_object
+from migrator.sftp_client import (
+    FileInfo,
+    SFTPConnectionError,
+    create_sftp_context,
+    close_sftp_context,
+    iter_files,
+    open_file
+)
 from migrator.manifest import (
-    Manifest,
-    FILE_STATUS_FAILED,
-    FILE_STATUS_SUCCESS,
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_IN_PROGRESS,
+    FILE_STATUS_FAILED,
+    FILE_STATUS_SUCCESS,
+    load_or_create_manifest,
+    needs_transfer,
+    mark_seen,
+    record_transfer,
+    reset_seen_flags,
+    get_unseen_success_files,
+    remove_file,
+    set_status,
+    all_successful,
+    commit_manifest,
+    get_failed_count
 )
-from migrator.s3_client import S3AuthError, S3Client, S3UploadError
-from migrator.sftp_client import (
-    FileInfo,
-    SFTPClient,
-    SFTPConnectionError,
-    create_sftp_client,
-)
-
 
 logger = logging.getLogger("migrator.transfer")
 
@@ -71,344 +82,230 @@ class MigrationStats:
         )
 
 
-def run_migration(
-    config: AppConfig,
-    folders_path: str,
-    dry_run: bool = False,
-) -> int:
-    """Main entry point for the migration process.
-
-    Processes folders sequentially. For each folder:
-    - Uploads 'in_progress' tracking to S3
-    - Transfers files concurrently
-    - Uploads final tracking status to S3
-    - Cleans up and marks folder as done
-
-    Args:
-        config: Application configuration.
-        folders_path: Path to folders.txt (for marking completion).
-        dry_run: If True, list files without transferring.
-
-    Returns:
-        Exit code (0 = success, 1 = some failures, 2 = fatal error).
-    """
-    stats = MigrationStats(start_time=time.time())
-
-    if not config.folders:
-        logger.info("No folders to migrate. Exiting.")
-        print(stats.summary())
-        return 0
-
-    # Initialize S3 client early to catch auth errors before any work
-    s3 = S3Client(config.s3)
-    try:
-        s3.connect()
-    except S3AuthError as e:
-        logger.critical("FATAL: S3 authentication failed: %s", e)
-        return 2
-
-    tracking_dir = _resolve_tracking_dir(config.base_dir)
-    multipart_threshold = config.options.multipart_threshold_mb * 1024 * 1024
-
-    for folder in config.folders:
-        logger.info("=" * 60)
-        logger.info("Processing folder: %s", folder)
-        logger.info("=" * 60)
-
-        try:
-            _process_folder(
-                folder=folder,
-                config=config,
-                s3=s3,
-                tracking_dir=tracking_dir,
-                folders_path=folders_path,
-                multipart_threshold=multipart_threshold,
-                dry_run=dry_run,
-                stats=stats,
-            )
-        except FatalMigrationError as e:
-            logger.critical("FATAL: %s", e)
-            logger.critical("Halting migration — remaining folders will not be processed")
-            print(stats.summary())
-            return 2
-
-    print(stats.summary())
-    return 0 if stats.failed == 0 and stats.folders_failed == 0 else 1
+@dataclass
+class TransferResult:
+    """Result of a single file transfer map operation."""
+    file_info: FileInfo
+    success: bool
+    bytes_transferred: int
+    error: Optional[Exception] = None
 
 
 def _resolve_tracking_dir(base_dir: str) -> str:
-    """Resolve the tracking directory path."""
     import os
     tracking_dir = os.path.join(base_dir, "tracking")
     os.makedirs(tracking_dir, exist_ok=True)
     return tracking_dir
 
 
+def _try_upload_tracking(s3_ctx: S3Context, tracking_path: str, sftp_folder: str) -> None:
+    try:
+        upload_tracking_db(s3_ctx, tracking_path, sftp_folder)
+    except Exception as e:
+        logger.error(
+            "Failed to upload tracking DB (best-effort) for %s: %s",
+            sftp_folder, e,
+        )
+
+
 def _process_folder(
     folder: str,
     config: AppConfig,
-    s3: S3Client,
+    s3_ctx: S3Context,
     tracking_dir: str,
     folders_path: str,
     multipart_threshold: int,
     dry_run: bool,
-    stats: MigrationStats,
+    continuous: bool = False,
+    stats: Optional[MigrationStats] = None,
 ) -> None:
-    """Process a single folder through the full lifecycle.
+    if stats is None:
+        stats = MigrationStats(start_time=time.time())
 
-    Raises:
-        FatalMigrationError: On unrecoverable errors.
-    """
-    # Step 1: Load or create manifest
-    manifest = Manifest.load_or_create(tracking_dir, folder)
+    manifest_ctx = load_or_create_manifest(tracking_dir, folder, s3_ctx)
 
-    # Step 2: Connect to SFTP and list files
-    try:
-        with SFTPClient(config.sftp) as sftp:
-            file_list = sftp.list_files(folder)
-    except SFTPConnectionError as e:
-        # Fatal: SFTP is down — no point continuing with other folders
-        manifest.set_status(STATUS_FAILED)
-        manifest.save()
-        _try_upload_tracking(s3, manifest)
-        raise FatalMigrationError(f"SFTP connection failed: {e}") from e
+    set_status(manifest_ctx, STATUS_IN_PROGRESS)
+    commit_manifest(manifest_ctx)
+    _try_upload_tracking(s3_ctx, manifest_ctx.tracking_path, folder)
 
-    logger.info("Found %d files in %s", len(file_list), folder)
-    manifest.total_files = len(file_list)
+    reset_seen_flags(manifest_ctx)
 
-    # Step 3: Filter out already-migrated files
-    to_transfer = []
-    for fi in file_list:
-        if manifest.needs_transfer(fi.path, fi.size, fi.mtime):
-            to_transfer.append(fi)
-        else:
-            stats.skipped += 1
-
-    stats.total_files += len(file_list)
-
-    logger.info(
-        "%d files to transfer, %d already up-to-date",
-        len(to_transfer),
-        len(file_list) - len(to_transfer),
-    )
-
-    if not to_transfer:
-        logger.info("Folder %s — nothing to transfer, marking as done", folder)
-        manifest.set_status(STATUS_COMPLETED)
-        manifest.save()
-        _try_upload_tracking(s3, manifest)
-        manifest.delete_local()
-        mark_folder_done(folders_path, folder)
-        stats.folders_completed += 1
-        return
-
-    # Step 4: Dry-run check
-    if dry_run:
-        logger.info("DRY RUN — would transfer %d files:", len(to_transfer))
-        for fi in to_transfer:
-            size_mb = fi.size / (1024 * 1024)
-            logger.info("  %s (%.2f MB)", fi.path, size_mb)
-        return
-
-    # Step 5: Upload 'in_progress' tracking to S3
-    manifest.set_status(STATUS_IN_PROGRESS)
-    manifest.save()
-    try:
-        s3.upload_tracking(manifest.to_json(), folder)
-    except S3AuthError as e:
-        raise FatalMigrationError(f"S3 auth failed uploading tracking: {e}") from e
-    except S3UploadError as e:
-        raise FatalMigrationError(
-            f"Cannot upload initial tracking to S3 (network issue?): {e}"
-        ) from e
-
-    # Step 6: Transfer files concurrently
     consecutive_failures = 0
     max_consecutive = config.options.consecutive_failure_threshold
+    batch_size = 5000  # Number of files to pull into thread pool at a time
 
+    try:
+        sftp_ctx = create_sftp_context(config.sftp)
+    except SFTPConnectionError as e:
+        set_status(manifest_ctx, STATUS_FAILED)
+        commit_manifest(manifest_ctx)
+        _try_upload_tracking(s3_ctx, manifest_ctx.tracking_path, folder)
+        raise FatalMigrationError(f"SFTP connection failed: {e}") from e
+
+    file_generator = iter_files(sftp_ctx, folder)
+    
     with ThreadPoolExecutor(max_workers=config.options.max_workers) as pool:
-        futures = {}
-        for fi in to_transfer:
-            s3_key = fi.path.lstrip("/")
-            future = pool.submit(
-                _transfer_single_file,
-                sftp_config=config.sftp,
-                s3_client=s3,
-                file_info=fi,
-                s3_key=s3_key,
-                multipart_threshold=multipart_threshold,
-                multipart_chunk_mb=config.options.multipart_chunk_mb,
-                max_retries=config.options.max_retries,
-                retry_backoff_base=config.options.retry_backoff_base,
-            )
-            futures[future] = fi
-
-        for future in as_completed(futures):
-            fi = futures[future]
+        while True:
+            # Buffer a batch of files
+            batch = []
             try:
-                bytes_sent = future.result()
-
-                # Success
-                manifest.record(
-                    path=fi.path,
-                    size=fi.size,
-                    mtime=fi.mtime,
-                    s3_key=fi.path.lstrip("/"),
-                    status=FILE_STATUS_SUCCESS,
-                )
-                stats.transferred += 1
-                stats.bytes_transferred += bytes_sent
-                consecutive_failures = 0  # Reset on success
-
-                logger.info(
-                    "✓ %s (%.2f MB)",
-                    fi.path,
-                    fi.size / (1024 * 1024),
-                )
-
-            except S3AuthError as e:
-                # Fatal — credentials expired mid-run
-                manifest.record(
-                    path=fi.path,
-                    size=fi.size,
-                    mtime=fi.mtime,
-                    s3_key=fi.path.lstrip("/"),
-                    status=FILE_STATUS_FAILED,
-                )
-                manifest.set_status(STATUS_FAILED)
-                manifest.save()
-                _try_upload_tracking(s3, manifest)
-                # Cancel remaining futures
-                for pending_future in futures:
-                    pending_future.cancel()
-                raise FatalMigrationError(
-                    f"S3 auth error during transfer: {e}"
-                ) from e
-
+                for _ in range(batch_size):
+                    batch.append(next(file_generator))
+            except StopIteration:
+                pass
             except SFTPConnectionError as e:
-                # Fatal — SFTP connection lost
-                manifest.record(
-                    path=fi.path,
-                    size=fi.size,
-                    mtime=fi.mtime,
-                    s3_key=fi.path.lstrip("/"),
-                    status=FILE_STATUS_FAILED,
-                )
-                manifest.set_status(STATUS_FAILED)
-                manifest.save()
-                _try_upload_tracking(s3, manifest)
-                for pending_future in futures:
-                    pending_future.cancel()
-                raise FatalMigrationError(
-                    f"SFTP connection lost during transfer: {e}"
-                ) from e
+                set_status(manifest_ctx, STATUS_FAILED)
+                commit_manifest(manifest_ctx)
+                _try_upload_tracking(s3_ctx, manifest_ctx.tracking_path, folder)
+                close_sftp_context(sftp_ctx)
+                raise FatalMigrationError(f"SFTP connection lost during listing: {e}") from e
 
+            if not batch:
+                break
+            
+            stats.total_files += len(batch)
+
+            to_transfer = []
+            for fi in batch:
+                if needs_transfer(manifest_ctx, fi.path, fi.size, fi.mtime):
+                    to_transfer.append(fi)
+                else:
+                    mark_seen(manifest_ctx, fi.path)
+                    stats.skipped += 1
+
+            if dry_run:
+                if to_transfer:
+                    logger.info("DRY RUN — would transfer %d files in this batch", len(to_transfer))
+                    for fi in to_transfer:
+                        mark_seen(manifest_ctx, fi.path) # still mark seen so it doesn't get deleted
+                continue
+
+            futures = []
+            for fi in to_transfer:
+                s3_key = fi.path.lstrip("/")
+                future = pool.submit(
+                    _transfer_single_file_map,
+                    sftp_config=config.sftp,
+                    s3_ctx=s3_ctx,
+                    file_info=fi,
+                    s3_key=s3_key,
+                    multipart_threshold=multipart_threshold,
+                    multipart_chunk_mb=config.options.multipart_chunk_mb,
+                    max_retries=config.options.max_retries,
+                    retry_backoff_base=config.options.retry_backoff_base,
+                )
+                futures.append(future)
+
+            for future in as_completed(futures):
+                try:
+                    result: TransferResult = future.result()
+                    fi = result.file_info
+                    
+                    if result.success:
+                        record_transfer(
+                            manifest_ctx,
+                            path=fi.path,
+                            size=fi.size,
+                            mtime=fi.mtime,
+                            s3_key=fi.path.lstrip("/"),
+                            status=FILE_STATUS_SUCCESS,
+                        )
+                        stats.transferred += 1
+                        stats.bytes_transferred += result.bytes_transferred
+                        consecutive_failures = 0
+                        logger.info("✓ %s (%.2f MB)", fi.path, fi.size / (1024 * 1024))
+                    else:
+                        e = result.error
+                        record_transfer(
+                            manifest_ctx,
+                            path=fi.path, size=fi.size, mtime=fi.mtime,
+                            s3_key=fi.path.lstrip("/"), status=FILE_STATUS_FAILED,
+                        )
+                        
+                        if isinstance(e, (S3AuthError, SFTPConnectionError)):
+                            set_status(manifest_ctx, STATUS_FAILED)
+                            commit_manifest(manifest_ctx)
+                            _try_upload_tracking(s3_ctx, manifest_ctx.tracking_path, folder)
+                            for pending_future in futures:
+                                pending_future.cancel()
+                            close_sftp_context(sftp_ctx)
+                            raise FatalMigrationError(f"Fatal error during transfer: {e}") from e
+                            
+                        stats.failed += 1
+                        consecutive_failures += 1
+                        logger.error("✗ %s — %s", fi.path, e)
+
+                        if consecutive_failures >= max_consecutive:
+                            set_status(manifest_ctx, STATUS_FAILED)
+                            commit_manifest(manifest_ctx)
+                            _try_upload_tracking(s3_ctx, manifest_ctx.tracking_path, folder)
+                            for pending_future in futures:
+                                pending_future.cancel()
+                            close_sftp_context(sftp_ctx)
+                            raise FatalMigrationError(f"{consecutive_failures} consecutive file failures")
+                            
+                except Exception as critical_e:
+                    logger.error("Critical error mapping future: %s", critical_e)
+                    raise FatalMigrationError(f"Critical mapping error: {critical_e}") from critical_e
+
+            commit_manifest(manifest_ctx)
+
+    close_sftp_context(sftp_ctx)
+
+    # Mirror sync deletions
+    to_delete = get_unseen_success_files(manifest_ctx)
+    if dry_run and to_delete:
+        logger.info("DRY RUN — would delete %d missing files from S3", len(to_delete))
+    elif to_delete:
+        for path, s3_key in to_delete:
+            try:
+                delete_object(s3_ctx, s3_key)
+                remove_file(manifest_ctx, path)
             except Exception as e:
-                # Per-file failure
-                manifest.record(
-                    path=fi.path,
-                    size=fi.size,
-                    mtime=fi.mtime,
-                    s3_key=fi.path.lstrip("/"),
-                    status=FILE_STATUS_FAILED,
-                )
-                stats.failed += 1
-                consecutive_failures += 1
+                logger.error("Failed to delete orphaned object %s from S3: %s", s3_key, e)
+    commit_manifest(manifest_ctx)
 
-                logger.error("✗ %s — %s", fi.path, e)
-
-                # Check consecutive failure threshold
-                if consecutive_failures >= max_consecutive:
-                    logger.critical(
-                        "%d consecutive failures — likely systemic issue, halting",
-                        consecutive_failures,
-                    )
-                    manifest.set_status(STATUS_FAILED)
-                    manifest.save()
-                    _try_upload_tracking(s3, manifest)
-                    for pending_future in futures:
-                        pending_future.cancel()
-                    raise FatalMigrationError(
-                        f"{consecutive_failures} consecutive file failures "
-                        f"— systemic issue detected"
-                    )
-
-            # Periodically save manifest (every file, since it's fast)
-            manifest.save()
-
-    # Step 7: Finalize folder
-    if manifest.all_successful():
-        manifest.set_status(STATUS_COMPLETED)
-        manifest.save()
-
-        try:
-            s3.upload_tracking(manifest.to_json(), folder)
-        except (S3AuthError, S3UploadError) as e:
-            logger.error("Failed to upload final tracking for %s: %s", folder, e)
-
-        manifest.delete_local()
-        mark_folder_done(folders_path, folder)
+    if all_successful(manifest_ctx):
+        set_status(manifest_ctx, STATUS_COMPLETED)
+        commit_manifest(manifest_ctx)
+        _try_upload_tracking(s3_ctx, manifest_ctx.tracking_path, folder)
+            
         stats.folders_completed += 1
         logger.info("✓ Folder completed: %s", folder)
     else:
-        manifest.set_status(STATUS_FAILED)
-        manifest.save()
-
-        try:
-            s3.upload_tracking(manifest.to_json(), folder)
-        except (S3AuthError, S3UploadError) as e:
-            logger.error("Failed to upload failed tracking for %s: %s", folder, e)
+        set_status(manifest_ctx, STATUS_FAILED)
+        commit_manifest(manifest_ctx)
+        _try_upload_tracking(s3_ctx, manifest_ctx.tracking_path, folder)
 
         stats.folders_failed += 1
         logger.warning(
             "✗ Folder has failures: %s (%d failed files — will retry on next run)",
             folder,
-            manifest.failed_count,
+            get_failed_count(manifest_ctx),
         )
 
 
-def _transfer_single_file(
+def _transfer_single_file_map(
     sftp_config: SFTPConfig,
-    s3_client: S3Client,
+    s3_ctx: S3Context,
     file_info: FileInfo,
     s3_key: str,
     multipart_threshold: int,
     multipart_chunk_mb: int,
     max_retries: int,
     retry_backoff_base: int,
-) -> int:
-    """Transfer a single file from SFTP to S3 with retries.
-
-    Each worker thread gets its own SFTP connection since paramiko
-    connections are not thread-safe.
-
-    Args:
-        sftp_config: SFTP connection config.
-        s3_client: Shared S3 client (boto3 clients are thread-safe).
-        file_info: File metadata (path, size, mtime).
-        s3_key: Target S3 key.
-        multipart_threshold: Size threshold for multipart upload.
-        multipart_chunk_mb: Chunk size for multipart parts.
-        max_retries: Maximum retry attempts.
-        retry_backoff_base: Base for exponential backoff (seconds).
-
-    Returns:
-        Number of bytes transferred.
-
-    Raises:
-        S3AuthError: If S3 credentials are invalid (fatal).
-        SFTPConnectionError: If SFTP connection fails (fatal).
-        Exception: If all retries exhausted (per-file failure).
-    """
+) -> TransferResult:
+    """Map function for transferring a single file."""
     last_error: Optional[Exception] = None
 
     for attempt in range(1, max_retries + 1):
-        sftp = None
+        sftp_ctx = None
         try:
-            sftp = create_sftp_client(sftp_config)
-            file_obj = sftp.open_file(file_info.path)
+            sftp_ctx = create_sftp_context(sftp_config)
+            file_obj = open_file(sftp_ctx, file_info.path)
 
-            s3_client.upload_stream(
+            upload_stream(
+                ctx=s3_ctx,
                 file_obj=file_obj,
                 s3_key=s3_key,
                 size=file_info.size,
@@ -416,12 +313,15 @@ def _transfer_single_file(
                 multipart_chunk_mb=multipart_chunk_mb,
             )
 
-            return file_info.size
+            return TransferResult(
+                file_info=file_info,
+                success=True,
+                bytes_transferred=file_info.size
+            )
 
-        except (S3AuthError, SFTPConnectionError):
-            # Fatal errors — re-raise immediately, don't retry
-            raise
-
+        except (S3AuthError, SFTPConnectionError) as e:
+            # Wrap immediately on fatal errors
+            return TransferResult(file_info=file_info, success=False, bytes_transferred=0, error=e)
         except Exception as e:
             last_error = e
             if attempt < max_retries:
@@ -436,23 +336,13 @@ def _transfer_single_file(
                     "All %d retries exhausted for %s: %s",
                     max_retries, file_info.path, e,
                 )
-
         finally:
-            if sftp:
-                sftp.close()
+            if sftp_ctx:
+                close_sftp_context(sftp_ctx)
 
-    raise last_error or Exception(f"Transfer failed for {file_info.path}")
-
-
-def _try_upload_tracking(s3: S3Client, manifest: Manifest) -> None:
-    """Best-effort upload of tracking JSON to S3.
-
-    Used during error handling — if this also fails, just log it.
-    """
-    try:
-        s3.upload_tracking(manifest.to_json(), manifest.sftp_folder)
-    except Exception as e:
-        logger.error(
-            "Failed to upload tracking (best-effort) for %s: %s",
-            manifest.sftp_folder, e,
-        )
+    return TransferResult(
+        file_info=file_info,
+        success=False,
+        bytes_transferred=0,
+        error=last_error or Exception(f"Transfer failed for {file_info.path}")
+    )

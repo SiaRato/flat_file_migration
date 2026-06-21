@@ -1,23 +1,24 @@
-"""Per-folder tracking manifest.
+"""Per-folder tracking manifest (Functional).
 
-Manages a JSON file that tracks the migration status of every file within
+Manages an SQLite database that tracks the migration status of every file within
 a single SFTP folder. Supports the status lifecycle:
     in_progress → completed | failed
 """
 
-import json
 import logging
 import os
 import posixpath
 import re
+import sqlite3
 import threading
 from datetime import datetime, timezone
-from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, Optional
+from typing import Any, Optional, List, Tuple
+
+from migrator.types import ManifestContext
+import migrator.s3_client as s3_client
 
 
 logger = logging.getLogger("migrator.manifest")
-
 
 # Overall migration status for a folder
 STATUS_IN_PROGRESS = "in_progress"
@@ -30,242 +31,193 @@ FILE_STATUS_FAILED = "failed"
 FILE_STATUS_PENDING = "pending"
 
 
-@dataclass
-class FileEntry:
-    """Tracking entry for a single file."""
-    size: int
-    mtime: float
-    s3_key: str
-    migrated_at: Optional[str] = None
-    status: str = FILE_STATUS_PENDING
+def load_or_create_manifest(
+    tracking_dir: str, sftp_folder: str, s3_ctx: Optional[Any] = None
+) -> ManifestContext:
+    """Load an existing database from disk or S3, or create a new one."""
+    os.makedirs(tracking_dir, exist_ok=True)
+    filename = _sanitize_folder_name(sftp_folder) + ".db"
+    tracking_path = os.path.join(tracking_dir, filename)
+
+    if s3_ctx:
+        try:
+            s3_data_bytes = s3_client.download_tracking_bytes(s3_ctx, sftp_folder)
+            if s3_data_bytes:
+                with open(tracking_path, "wb") as f:
+                    f.write(s3_data_bytes)
+                logger.info("Downloaded and applied tracking DB from S3 for %s", sftp_folder)
+        except Exception as e:
+            logger.warning("Failed to fetch tracking DB from S3 for %s: %s", sftp_folder, e)
+
+    lock = threading.Lock()
+    conn = sqlite3.connect(tracking_path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+
+    ctx = ManifestContext(
+        tracking_path=tracking_path,
+        sftp_folder=sftp_folder,
+        conn=conn,
+        lock=lock,
+    )
+
+    _init_db(ctx)
+    return ctx
 
 
-class Manifest:
-    """Per-folder tracking manifest.
+def _init_db(ctx: ManifestContext):
+    """Initialize SQLite database schema with optimizations."""
+    with ctx.lock:
+        cursor = ctx.conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA synchronous=NORMAL;")
+        
+        # Create meta table for folder status
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        
+        # Create files table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS files (
+                path TEXT PRIMARY KEY,
+                size INTEGER,
+                mtime REAL,
+                s3_key TEXT,
+                migrated_at TEXT,
+                status TEXT,
+                seen INTEGER DEFAULT 0
+            )
+        """)
+        
+        # Create indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_seen_status ON files(seen, status)")
+        
+        ctx.conn.commit()
 
-    Thread-safe: uses a lock for all mutations so concurrent workers
-    can safely call record().
+        # Initialize meta if empty
+        cursor.execute("SELECT value FROM meta WHERE key = 'status'")
+        if not cursor.fetchone():
+            cursor.execute("INSERT INTO meta (key, value) VALUES ('status', ?)", (STATUS_IN_PROGRESS,))
+            cursor.execute("INSERT INTO meta (key, value) VALUES ('started_at', ?)", (_now_iso(),))
+            ctx.conn.commit()
+
+
+def needs_transfer(ctx: ManifestContext, path: str, size: int, mtime: float) -> bool:
+    """Check if a file needs to be transferred."""
+    with ctx.lock:
+        cursor = ctx.conn.cursor()
+        cursor.execute("SELECT size, mtime, status FROM files WHERE path = ?", (path,))
+        row = cursor.fetchone()
+        
+        if row is None:
+            return True
+        if row['status'] != FILE_STATUS_SUCCESS:
+            return True
+        if row['size'] != size or row['mtime'] != mtime:
+            return True
+        return False
+
+
+def mark_seen(ctx: ManifestContext, path: str) -> None:
+    """Mark a file as seen during the SFTP scan."""
+    with ctx.lock:
+        ctx.conn.execute("UPDATE files SET seen = 1 WHERE path = ?", (path,))
+
+
+def record_transfer(
+    ctx: ManifestContext,
+    path: str,
+    size: int,
+    mtime: float,
+    s3_key: str,
+    status: str,
+) -> None:
+    """Record the result of a file transfer."""
+    with ctx.lock:
+        migrated_at = _now_iso() if status == FILE_STATUS_SUCCESS else None
+        ctx.conn.execute("""
+            INSERT OR REPLACE INTO files (path, size, mtime, s3_key, migrated_at, status, seen)
+            VALUES (?, ?, ?, ?, ?, ?, 1)
+        """, (path, size, mtime, s3_key, migrated_at, status))
+
+
+def reset_seen_flags(ctx: ManifestContext) -> None:
+    """Reset all seen flags to 0 at the start of a mirror sync."""
+    with ctx.lock:
+        ctx.conn.execute("UPDATE files SET seen = 0")
+        ctx.conn.commit()
+
+
+def get_unseen_success_files(ctx: ManifestContext) -> List[Tuple[str, str]]:
+    """Return files that were successful but not seen in the current scan.
+    Returns a list of (path, s3_key) tuples.
     """
+    with ctx.lock:
+        cursor = ctx.conn.cursor()
+        cursor.execute("SELECT path, s3_key FROM files WHERE seen = 0 AND status = 'success'")
+        return [(row['path'], row['s3_key']) for row in cursor.fetchall()]
 
-    def __init__(self, tracking_path: str, sftp_folder: str):
-        self._tracking_path = tracking_path
-        self._sftp_folder = sftp_folder
-        self._lock = threading.Lock()
 
-        self.version: int = 1
-        self.status: str = STATUS_IN_PROGRESS
-        self.started_at: str = _now_iso()
-        self.completed_at: Optional[str] = None
-        self.total_files: int = 0
-        self.migrated_count: int = 0
-        self.failed_count: int = 0
-        self.files: Dict[str, FileEntry] = {}
+def remove_file(ctx: ManifestContext, path: str) -> None:
+    """Remove a file from the manifest."""
+    with ctx.lock:
+        ctx.conn.execute("DELETE FROM files WHERE path = ?", (path,))
 
-    @property
-    def tracking_path(self) -> str:
-        """Local file path for this manifest."""
-        return self._tracking_path
 
-    @property
-    def sftp_folder(self) -> str:
-        """The SFTP folder this manifest tracks."""
-        return self._sftp_folder
+def set_status(ctx: ManifestContext, status: str) -> None:
+    """Set the overall migration status for this folder."""
+    with ctx.lock:
+        ctx.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('status', ?)", (status,))
+        if status in (STATUS_COMPLETED, STATUS_FAILED):
+            ctx.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('completed_at', ?)", (_now_iso(),))
+        ctx.conn.commit()
 
-    @classmethod
-    def load_or_create(
-        cls, tracking_dir: str, sftp_folder: str
-    ) -> "Manifest":
-        """Load an existing manifest from disk or create a new one.
 
-        Args:
-            tracking_dir: Directory where tracking JSON files are stored.
-            sftp_folder: The SFTP folder path this manifest tracks.
+def get_failed_count(ctx: ManifestContext) -> int:
+    with ctx.lock:
+        cursor = ctx.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM files WHERE status = 'failed'")
+        return cursor.fetchone()[0]
 
-        Returns:
-            A Manifest instance (loaded from disk if available).
-        """
-        os.makedirs(tracking_dir, exist_ok=True)
-        filename = _sanitize_folder_name(sftp_folder) + ".json"
-        tracking_path = os.path.join(tracking_dir, filename)
 
-        manifest = cls(tracking_path=tracking_path, sftp_folder=sftp_folder)
+def all_successful(ctx: ManifestContext) -> bool:
+    """Check if all tracked files were migrated successfully."""
+    return get_failed_count(ctx) == 0
 
-        if os.path.isfile(tracking_path):
-            try:
-                with open(tracking_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
 
-                manifest.version = data.get("version", 1)
-                manifest.status = data.get("status", STATUS_IN_PROGRESS)
-                manifest.started_at = data.get("started_at", _now_iso())
-                manifest.completed_at = data.get("completed_at")
-                manifest.total_files = data.get("total_files", 0)
-                manifest.migrated_count = data.get("migrated_count", 0)
-                manifest.failed_count = data.get("failed_count", 0)
+def commit_manifest(ctx: ManifestContext) -> None:
+    """Commit batched transactions to disk."""
+    with ctx.lock:
+        ctx.conn.commit()
 
-                for path, entry_data in data.get("files", {}).items():
-                    manifest.files[path] = FileEntry(
-                        size=entry_data.get("size", 0),
-                        mtime=entry_data.get("mtime", 0),
-                        s3_key=entry_data.get("s3_key", ""),
-                        migrated_at=entry_data.get("migrated_at"),
-                        status=entry_data.get("status", FILE_STATUS_PENDING),
-                    )
 
-                logger.info(
-                    "Loaded existing manifest for %s — %d files tracked "
-                    "(%d successful, %d failed)",
-                    sftp_folder,
-                    len(manifest.files),
-                    manifest.migrated_count,
-                    manifest.failed_count,
-                )
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(
-                    "Corrupt manifest at %s, starting fresh: %s",
-                    tracking_path, e,
-                )
-                manifest = cls(tracking_path=tracking_path, sftp_folder=sftp_folder)
-        else:
-            logger.info("Creating new manifest for folder: %s", sftp_folder)
+def delete_local(ctx: ManifestContext) -> None:
+    """Delete the local tracking file."""
+    ctx.conn.close()
+    if os.path.isfile(ctx.tracking_path):
+        os.remove(ctx.tracking_path)
+        # Delete WAL files too
+        wal_path = ctx.tracking_path + "-wal"
+        shm_path = ctx.tracking_path + "-shm"
+        if os.path.isfile(wal_path):
+            os.remove(wal_path)
+        if os.path.isfile(shm_path):
+            os.remove(shm_path)
+        logger.info("Deleted local tracking DB: %s", ctx.tracking_path)
 
-        return manifest
 
-    def needs_transfer(self, path: str, size: int, mtime: float) -> bool:
-        """Check if a file needs to be transferred.
-
-        A file is skipped if it already exists in the manifest with
-        status=success AND the same size+mtime.
-
-        Args:
-            path: SFTP file path.
-            size: File size in bytes.
-            mtime: File modification time (epoch).
-
-        Returns:
-            True if the file needs to be transferred.
-        """
-        with self._lock:
-            entry = self.files.get(path)
-            if entry is None:
-                return True
-            if entry.status != FILE_STATUS_SUCCESS:
-                return True
-            # Re-transfer if file has changed
-            if entry.size != size or entry.mtime != mtime:
-                return True
-            return False
-
-    def record(
-        self,
-        path: str,
-        size: int,
-        mtime: float,
-        s3_key: str,
-        status: str,
-    ) -> None:
-        """Record the result of a file transfer.
-
-        Args:
-            path: SFTP file path.
-            size: File size in bytes.
-            mtime: File modification time (epoch).
-            s3_key: The S3 key the file was uploaded to.
-            status: FILE_STATUS_SUCCESS or FILE_STATUS_FAILED.
-        """
-        with self._lock:
-            old_entry = self.files.get(path)
-
-            # Update counters: undo previous status if re-recording
-            if old_entry:
-                if old_entry.status == FILE_STATUS_SUCCESS:
-                    self.migrated_count = max(0, self.migrated_count - 1)
-                elif old_entry.status == FILE_STATUS_FAILED:
-                    self.failed_count = max(0, self.failed_count - 1)
-
-            self.files[path] = FileEntry(
-                size=size,
-                mtime=mtime,
-                s3_key=s3_key,
-                migrated_at=_now_iso() if status == FILE_STATUS_SUCCESS else None,
-                status=status,
-            )
-
-            if status == FILE_STATUS_SUCCESS:
-                self.migrated_count += 1
-            elif status == FILE_STATUS_FAILED:
-                self.failed_count += 1
-
-    def set_status(self, status: str) -> None:
-        """Set the overall migration status for this folder.
-
-        Args:
-            status: STATUS_IN_PROGRESS, STATUS_COMPLETED, or STATUS_FAILED.
-        """
-        with self._lock:
-            self.status = status
-            if status in (STATUS_COMPLETED, STATUS_FAILED):
-                self.completed_at = _now_iso()
-
-    def all_successful(self) -> bool:
-        """Check if all tracked files were migrated successfully."""
-        with self._lock:
-            if not self.files:
-                return True
-            return all(
-                entry.status == FILE_STATUS_SUCCESS
-                for entry in self.files.values()
-            )
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Serialize manifest to a dictionary."""
-        with self._lock:
-            return {
-                "version": self.version,
-                "sftp_folder": self._sftp_folder,
-                "status": self.status,
-                "started_at": self.started_at,
-                "completed_at": self.completed_at,
-                "total_files": self.total_files,
-                "migrated_count": self.migrated_count,
-                "failed_count": self.failed_count,
-                "files": {
-                    path: asdict(entry)
-                    for path, entry in self.files.items()
-                },
-            }
-
-    def to_json(self) -> str:
-        """Serialize manifest to a JSON string."""
-        return json.dumps(self.to_dict(), indent=2, ensure_ascii=False)
-
-    def save(self) -> None:
-        """Write manifest to disk."""
-        data = self.to_json()
-        # Write atomically: write to temp then rename
-        tmp_path = self._tracking_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(data)
-        os.replace(tmp_path, self._tracking_path)
-        logger.debug("Saved manifest to %s", self._tracking_path)
-
-    def delete_local(self) -> None:
-        """Delete the local tracking file."""
-        if os.path.isfile(self._tracking_path):
-            os.remove(self._tracking_path)
-            logger.info("Deleted local tracking file: %s", self._tracking_path)
+def close_manifest(ctx: ManifestContext):
+    """Close DB connection."""
+    ctx.conn.close()
 
 
 def _sanitize_folder_name(folder: str) -> str:
-    """Convert an SFTP folder path to a safe filename.
-
-    Example: /data/reports → data__reports
-    """
-    # Normalize and strip leading /
+    """Convert an SFTP folder path to a safe filename."""
     norm = posixpath.normpath(folder).lstrip("/")
-    # Replace / with __
     sanitized = norm.replace("/", "__")
-    # Remove any chars that aren't alphanumeric, underscore, hyphen, or dot
     sanitized = re.sub(r"[^\w\-.]", "_", sanitized)
     return sanitized or "root"
 

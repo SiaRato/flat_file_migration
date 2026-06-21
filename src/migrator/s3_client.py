@@ -1,4 +1,4 @@
-"""S3 client wrapper.
+"""S3 client wrapper (Functional).
 
 Provides streaming uploads (regular and multipart) and tracking file uploads
 via boto3.
@@ -17,6 +17,7 @@ from botocore.exceptions import (
 )
 
 from migrator.config import S3Config
+from migrator.types import S3Context
 
 
 logger = logging.getLogger("migrator.s3")
@@ -35,233 +36,254 @@ class S3UploadError(Exception):
     pass
 
 
-class S3Client:
-    """Wrapper around boto3 S3 client."""
+def create_s3_context(config: S3Config) -> S3Context:
+    """Initialize the boto3 S3 client and return the context.
 
-    def __init__(self, config: S3Config):
-        self._config = config
-        self._client = None
-
-    def connect(self) -> None:
-        """Initialize the boto3 S3 client.
-
-        Raises:
-            S3AuthError: If AWS credentials are missing or invalid.
-        """
-        try:
-            self._client = boto3.client(
-                "s3",
-                region_name=self._config.region,
-            )
-            # Validate credentials with a lightweight call
-            self._client.head_bucket(Bucket=self._config.bucket)
-            logger.info(
-                "S3 connection validated — bucket: %s, region: %s",
-                self._config.bucket,
-                self._config.region,
-            )
-        except (NoCredentialsError, PartialCredentialsError) as e:
-            raise S3AuthError(
-                f"AWS credentials not found or incomplete: {e}"
-            ) from e
-        except ClientError as e:
-            error_code = e.response.get("Error", {}).get("Code", "")
-            if error_code in ("403", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
-                raise S3AuthError(
-                    f"S3 access denied for bucket {self._config.bucket}: {e}"
-                ) from e
-            elif error_code == "404":
-                raise S3AuthError(
-                    f"S3 bucket not found: {self._config.bucket}"
-                ) from e
-            raise S3AuthError(
-                f"S3 connection error: {e}"
-            ) from e
-
-    def _build_key(self, relative_path: str) -> str:
-        """Build the full S3 key from a relative path.
-
-        Strips leading '/' from the path and prepends the configured prefix.
-        """
-        clean_path = relative_path.lstrip("/")
-        if self._config.prefix:
-            return f"{self._config.prefix.strip('/')}/{clean_path}"
-        return clean_path
-
-    def upload_stream(
-        self,
-        file_obj: IO[bytes],
-        s3_key: str,
-        size: int,
-        multipart_threshold: int,
-        multipart_chunk_mb: int,
-    ) -> None:
-        """Upload a file stream to S3.
-
-        Chooses between regular put_object and multipart upload based on
-        the file size.
-
-        Args:
-            file_obj: File-like object to read from.
-            s3_key: Target S3 key.
-            size: File size in bytes.
-            multipart_threshold: Size threshold in bytes for multipart.
-            multipart_chunk_mb: Chunk size in MB for multipart parts.
-
-        Raises:
-            S3AuthError: If credentials are invalid (fatal).
-            S3UploadError: If the upload fails (per-file, retriable).
-        """
-        full_key = self._build_key(s3_key)
-
-        try:
-            if size <= multipart_threshold:
-                self._upload_regular(file_obj, full_key, size)
-            else:
-                self._upload_multipart(file_obj, full_key, size, multipart_chunk_mb)
-        except (NoCredentialsError, PartialCredentialsError) as e:
-            raise S3AuthError(f"AWS credentials error during upload: {e}") from e
-        except ClientError as e:
-            error_code = e.response.get("Error", {}).get("Code", "")
-            if error_code in ("403", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
-                raise S3AuthError(f"S3 access denied: {e}") from e
-            raise S3UploadError(
-                f"Failed to upload {full_key}: {e}"
-            ) from e
-        except (BotoCoreError, IOError) as e:
-            raise S3UploadError(
-                f"Failed to upload {full_key}: {e}"
-            ) from e
-
-    def _upload_regular(
-        self, file_obj: IO[bytes], full_key: str, size: int
-    ) -> None:
-        """Upload using put_object (for files within the threshold)."""
-        logger.debug("Uploading %s (%d bytes) via put_object", full_key, size)
-
-        # Read entire file into memory for put_object
-        # For files up to ~100MB this is acceptable
-        data = file_obj.read()
-        self._client.put_object(
-            Bucket=self._config.bucket,
-            Key=full_key,
-            Body=data,
+    Raises:
+        S3AuthError: If AWS credentials are missing or invalid.
+    """
+    try:
+        client = boto3.client(
+            "s3",
+            region_name=config.region,
         )
-        logger.debug("Upload completed: %s", full_key)
-
-    def _upload_multipart(
-        self,
-        file_obj: IO[bytes],
-        full_key: str,
-        size: int,
-        chunk_mb: int,
-    ) -> None:
-        """Upload using multipart upload API (for large files)."""
-        chunk_size = chunk_mb * 1024 * 1024
+        # Validate credentials with a lightweight call
+        client.head_bucket(Bucket=config.bucket)
         logger.info(
-            "Uploading %s (%d bytes) via multipart (%d MB chunks)",
-            full_key, size, chunk_mb,
+            "S3 connection validated — bucket: %s, region: %s",
+            config.bucket,
+            config.region,
         )
+        return S3Context(config=config, client=client)
+    except (NoCredentialsError, PartialCredentialsError) as e:
+        raise S3AuthError(
+            f"AWS credentials not found or incomplete: {e}"
+        ) from e
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        if error_code in ("403", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
+            raise S3AuthError(
+                f"S3 access denied for bucket {config.bucket}: {e}"
+            ) from e
+        elif error_code == "404":
+            raise S3AuthError(
+                f"S3 bucket not found: {config.bucket}"
+            ) from e
+        raise S3AuthError(
+            f"S3 connection error: {e}"
+        ) from e
 
-        upload_id = None
-        try:
-            # Initiate multipart upload
-            response = self._client.create_multipart_upload(
-                Bucket=self._config.bucket,
-                Key=full_key,
-            )
-            upload_id = response["UploadId"]
 
-            parts = []
-            part_number = 1
+def _build_key(config: S3Config, relative_path: str) -> str:
+    """Build the full S3 key from a relative path."""
+    clean_path = relative_path.lstrip("/")
+    if config.prefix:
+        return f"{config.prefix.strip('/')}/{clean_path}"
+    return clean_path
 
-            while True:
-                chunk = file_obj.read(chunk_size)
-                if not chunk:
-                    break
 
-                part_response = self._client.upload_part(
-                    Bucket=self._config.bucket,
-                    Key=full_key,
-                    UploadId=upload_id,
-                    PartNumber=part_number,
-                    Body=chunk,
-                )
+def upload_stream(
+    ctx: S3Context,
+    file_obj: IO[bytes],
+    s3_key: str,
+    size: int,
+    multipart_threshold: int,
+    multipart_chunk_mb: int,
+) -> None:
+    """Upload a file stream to S3.
 
-                parts.append({
-                    "PartNumber": part_number,
-                    "ETag": part_response["ETag"],
-                })
+    Chooses between regular put_object and multipart upload based on
+    the file size.
+    """
+    full_key = _build_key(ctx.config, s3_key)
 
-                logger.debug(
-                    "Uploaded part %d/%d for %s",
-                    part_number,
-                    max(1, (size + chunk_size - 1) // chunk_size),
-                    full_key,
-                )
-                part_number += 1
+    try:
+        if size <= multipart_threshold:
+            _upload_regular(ctx, file_obj, full_key, size)
+        else:
+            _upload_multipart(ctx, file_obj, full_key, size, multipart_chunk_mb)
+    except (NoCredentialsError, PartialCredentialsError) as e:
+        raise S3AuthError(f"AWS credentials error during upload: {e}") from e
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        if error_code in ("403", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
+            raise S3AuthError(f"S3 access denied: {e}") from e
+        raise S3UploadError(
+            f"Failed to upload {full_key}: {e}"
+        ) from e
+    except (BotoCoreError, IOError) as e:
+        raise S3UploadError(
+            f"Failed to upload {full_key}: {e}"
+        ) from e
 
-            # Complete multipart upload
-            self._client.complete_multipart_upload(
-                Bucket=self._config.bucket,
+
+def _upload_regular(
+    ctx: S3Context, file_obj: IO[bytes], full_key: str, size: int
+) -> None:
+    """Upload using put_object (for files within the threshold)."""
+    logger.debug("Uploading %s (%d bytes) via put_object", full_key, size)
+    data = file_obj.read()
+    ctx.client.put_object(
+        Bucket=ctx.config.bucket,
+        Key=full_key,
+        Body=data,
+    )
+    logger.debug("Upload completed: %s", full_key)
+
+
+def _upload_multipart(
+    ctx: S3Context,
+    file_obj: IO[bytes],
+    full_key: str,
+    size: int,
+    chunk_mb: int,
+) -> None:
+    """Upload using multipart upload API (for large files)."""
+    chunk_size = chunk_mb * 1024 * 1024
+    logger.info(
+        "Uploading %s (%d bytes) via multipart (%d MB chunks)",
+        full_key, size, chunk_mb,
+    )
+
+    upload_id = None
+    try:
+        response = ctx.client.create_multipart_upload(
+            Bucket=ctx.config.bucket,
+            Key=full_key,
+        )
+        upload_id = response["UploadId"]
+
+        parts = []
+        part_number = 1
+
+        while True:
+            chunk = file_obj.read(chunk_size)
+            if not chunk:
+                break
+
+            part_response = ctx.client.upload_part(
+                Bucket=ctx.config.bucket,
                 Key=full_key,
                 UploadId=upload_id,
-                MultipartUpload={"Parts": parts},
+                PartNumber=part_number,
+                Body=chunk,
             )
-            logger.info("Multipart upload completed: %s (%d parts)", full_key, len(parts))
 
-        except Exception:
-            # Abort multipart upload on failure to avoid orphaned parts
-            if upload_id:
-                try:
-                    self._client.abort_multipart_upload(
-                        Bucket=self._config.bucket,
-                        Key=full_key,
-                        UploadId=upload_id,
-                    )
-                    logger.warning("Aborted multipart upload for %s", full_key)
-                except Exception as abort_err:
-                    logger.error(
-                        "Failed to abort multipart upload for %s: %s",
-                        full_key, abort_err,
-                    )
-            raise
+            parts.append({
+                "PartNumber": part_number,
+                "ETag": part_response["ETag"],
+            })
 
-    def upload_tracking(self, manifest_json: str, sftp_folder: str) -> None:
-        """Upload a tracking JSON to the tracking prefix in S3.
+            logger.debug(
+                "Uploaded part %d/%d for %s",
+                part_number,
+                max(1, (size + chunk_size - 1) // chunk_size),
+                full_key,
+            )
+            part_number += 1
 
-        Args:
-            manifest_json: The JSON string to upload.
-            sftp_folder: The SFTP folder name (used to derive the S3 key).
-
-        Raises:
-            S3AuthError: If credentials are invalid (fatal).
-            S3UploadError: If upload fails.
-        """
-        from migrator.manifest import _sanitize_folder_name
-
-        folder_name = _sanitize_folder_name(sftp_folder)
-        tracking_key = (
-            f"{self._config.tracking_prefix.strip('/')}/{folder_name}.json"
+        ctx.client.complete_multipart_upload(
+            Bucket=ctx.config.bucket,
+            Key=full_key,
+            UploadId=upload_id,
+            MultipartUpload={"Parts": parts},
         )
+        logger.info("Multipart upload completed: %s (%d parts)", full_key, len(parts))
 
-        try:
-            self._client.put_object(
-                Bucket=self._config.bucket,
-                Key=tracking_key,
-                Body=manifest_json.encode("utf-8"),
-                ContentType="application/json",
-            )
-            logger.info(
-                "Uploaded tracking to s3://%s/%s",
-                self._config.bucket, tracking_key,
-            )
-        except (NoCredentialsError, PartialCredentialsError) as e:
-            raise S3AuthError(f"AWS credentials error: {e}") from e
-        except ClientError as e:
-            error_code = e.response.get("Error", {}).get("Code", "")
-            if error_code in ("403", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
-                raise S3AuthError(f"S3 access denied: {e}") from e
-            raise S3UploadError(
-                f"Failed to upload tracking for {sftp_folder}: {e}"
-            ) from e
+    except Exception:
+        if upload_id:
+            try:
+                ctx.client.abort_multipart_upload(
+                    Bucket=ctx.config.bucket,
+                    Key=full_key,
+                    UploadId=upload_id,
+                )
+                logger.warning("Aborted multipart upload for %s", full_key)
+            except Exception as abort_err:
+                logger.error(
+                    "Failed to abort multipart upload for %s: %s",
+                    full_key, abort_err,
+                )
+        raise
+
+
+def upload_tracking_db(ctx: S3Context, db_path: str, sftp_folder: str) -> None:
+    """Upload a tracking DB to the tracking prefix in S3."""
+    from migrator.manifest import _sanitize_folder_name
+
+    folder_name = _sanitize_folder_name(sftp_folder)
+    tracking_key = (
+        f"{ctx.config.tracking_prefix.strip('/')}/{folder_name}.db"
+    )
+
+    try:
+        with open(db_path, "rb") as f:
+            data = f.read()
+            
+        ctx.client.put_object(
+            Bucket=ctx.config.bucket,
+            Key=tracking_key,
+            Body=data,
+            ContentType="application/octet-stream",
+        )
+        logger.info(
+            "Uploaded tracking DB to s3://%s/%s",
+            ctx.config.bucket, tracking_key,
+        )
+    except (NoCredentialsError, PartialCredentialsError) as e:
+        raise S3AuthError(f"AWS credentials error: {e}") from e
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        if error_code in ("403", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
+            raise S3AuthError(f"S3 access denied: {e}") from e
+        raise S3UploadError(
+            f"Failed to upload tracking DB for {sftp_folder}: {e}"
+        ) from e
+
+
+def download_tracking_bytes(ctx: S3Context, sftp_folder: str) -> Optional[bytes]:
+    """Download tracking DB from S3."""
+    from migrator.manifest import _sanitize_folder_name
+    folder_name = _sanitize_folder_name(sftp_folder)
+    tracking_key = (
+        f"{ctx.config.tracking_prefix.strip('/')}/{folder_name}.db"
+    )
+
+    try:
+        response = ctx.client.get_object(
+            Bucket=ctx.config.bucket,
+            Key=tracking_key,
+        )
+        data = response["Body"].read()
+        logger.debug("Downloaded tracking DB from s3://%s/%s", ctx.config.bucket, tracking_key)
+        return data
+    except (NoCredentialsError, PartialCredentialsError) as e:
+        raise S3AuthError(f"AWS credentials error: {e}") from e
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        if error_code in ("403", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
+            raise S3AuthError(f"S3 access denied: {e}") from e
+        if error_code == "NoSuchKey":
+            return None
+        logger.warning("Failed to download tracking for %s: %s", sftp_folder, e)
+        return None
+
+
+def delete_object(ctx: S3Context, s3_key: str) -> None:
+    """Delete an object from S3."""
+    full_key = _build_key(ctx.config, s3_key)
+    try:
+        ctx.client.delete_object(
+            Bucket=ctx.config.bucket,
+            Key=full_key,
+        )
+        logger.info("Deleted S3 object: %s", full_key)
+    except (NoCredentialsError, PartialCredentialsError) as e:
+        raise S3AuthError(f"AWS credentials error during deletion: {e}") from e
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        if error_code in ("403", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
+            raise S3AuthError(f"S3 access denied: {e}") from e
+        raise S3UploadError(
+            f"Failed to delete {full_key}: {e}"
+        ) from e

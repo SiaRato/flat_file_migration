@@ -14,23 +14,21 @@ Designed for deployment on **air-gapped midman servers** with network access lim
 
 ## Features
 
-- **Stream-based transfer** — files are streamed directly from SFTP to S3 without touching local disk
-- **Concurrent transfers** — configurable thread pool for parallel file uploads within each folder
-- **Multipart uploads** — automatic for files larger than a configurable threshold (default: 100 MB)
-- **Per-folder tracking** — JSON manifest tracks every file's migration status
-- **Smart change detection** — skips files that haven't changed (size + mtime comparison)
-- **Resume support** — interrupted migrations resume from where they left off
-- **Nested folder deduplication** — automatically removes overlapping folders from the list
-- **Error classification** — fatal errors halt the program; per-file errors are retried
-- **Consecutive failure detection** — halts if N files fail in a row (likely systemic issue)
-- **Dry-run mode** — preview what would be transferred without uploading
-- **Pre-migration tracking** — uploads `in_progress` status to S3 before starting, allowing external monitoring
+- **Infinite Scale Database Tracking** — backed by an ultra-fast local SQLite database instead of in-memory JSON to support tens of millions of files.
+- **Daemon Scheduler** — running `./run.sh` launches the persistent Daemon by default. It reads standard cron schedules directly from `folders.txt` and manages its own internal triggers via a SQLite scheduling database.
+- **Strict Mirror Sync** — automatically deletes orphaned S3 files that were removed from the SFTP server, keeping the destination perfectly in sync.
+- **Streaming SFTP Generator** — pulls file metadata over the network one-by-one, keeping memory usage flat regardless of folder size.
+- **Stream-based transfer** — files are streamed directly from SFTP to S3 without touching local disk.
+- **Concurrent transfers** — configurable thread pool for parallel file uploads within each folder.
+- **Multipart uploads** — automatic for files larger than a configurable threshold (default: 100 MB).
+- **Smart change detection** — skips files that haven't changed (size + mtime comparison).
+- **Stateless Resilience** — tracking history is downloaded from S3 at the start, making the midman server completely disposable.
 
 ## Prerequisites
 
 - Python 3.10+ on the midman server
 - SFTP server credentials (password-based authentication)
-- AWS credentials with `s3:PutObject`, `s3:CreateMultipartUpload`, etc. on the target bucket
+- AWS credentials with `s3:PutObject`, `s3:CreateMultipartUpload`, `s3:DeleteObject`, etc. on the target bucket
 
 ## Building the Bundle
 
@@ -87,21 +85,14 @@ options:
   log_file: "logs/migrator.log"
 ```
 
-### `folders.txt`
-
-One SFTP folder path per line:
+One SFTP folder path per line. You can optionally prefix lines with a standard 5-part crontab expression to schedule jobs:
 
 ```
-/data/reports
-/data/exports/2024
-/archive/logs
-```
+# Scheduled jobs
+0 2 * * * /data/exports/2024
+*/15 * * * * /data/reports
 
-Completed folders are automatically marked:
-
-```
-# DONE: /data/reports
-/data/exports/2024
+# One-time jobs (will run exactly once per daemon boot)
 /archive/logs
 ```
 
@@ -126,8 +117,11 @@ export AWS_SECRET_ACCESS_KEY=xxx
 # Preview (recommended first run)
 ./run.sh --dry-run
 
-# Run migration
+# Run the persistent daemon scheduler (Default mode)
 ./run.sh
+
+# Override folders.txt and run a single specific folder manually
+./run.sh --folder /data/reports
 
 # Verbose logging
 ./run.sh --log-level DEBUG
@@ -137,14 +131,15 @@ export AWS_SECRET_ACCESS_KEY=xxx
 
 ### Per-Folder Lifecycle
 
-1. **Load tracking** — existing tracking file on disk means resume; new file means fresh start
-2. **List files** — recursively list all files in the SFTP folder
-3. **Filter** — skip files already migrated (size + mtime match)
-4. **Upload `in_progress`** — push tracking JSON to S3 to signal migration has started
-5. **Transfer** — stream files from SFTP to S3 using concurrent workers
-6. **Finalize**:
-   - ✓ All files succeeded → upload `completed` tracking → delete local tracking → mark folder `# DONE:`
-   - ✗ Some files failed → upload `failed` tracking → keep local tracking for next run
+1. **Load tracking** — downloads the historical SQLite tracking database from S3.
+2. **Streaming Discovery** — uses a generator to stream files from the SFTP folder one by one.
+3. **Filter** — instantly queries the SQLite database to skip files already migrated (size + mtime match).
+4. **Upload `in_progress`** — pushes tracking DB to S3 to signal migration has started.
+5. **Transfer** — streams files from SFTP to S3 using batched concurrent workers.
+6. **Mirror Pruning** — identifies files missing from SFTP and gracefully deletes them from S3.
+7. **Finalize**:
+   - ✓ All files succeeded → upload `completed` tracking DB.
+   - ✗ Some files failed → upload `failed` tracking DB → keep local tracking for next run.
 
 ### Error Handling
 
@@ -156,13 +151,7 @@ export AWS_SECRET_ACCESS_KEY=xxx
 
 ### Tracking Status on S3
 
-Check `s3://bucket/migration-tracking/*.json` to monitor progress:
-
-| Status | Meaning |
-|---|---|
-| `in_progress` | Migration started — if it stays here, migration is stuck/crashed |
-| `completed` | All files migrated successfully |
-| `failed` | Some files failed — will retry on next run |
+Check `s3://bucket/migration-tracking/*.db` to monitor progress. You can download these SQLite `.db` files and run queries locally to view deep statistics.
 
 ## Deployment Structure
 
@@ -173,7 +162,7 @@ Check `s3://bucket/migration-tracking/*.json` to monitor progress:
 ├── folders.txt         ← SFTP folders to migrate
 ├── src/migrator/       ← source code
 ├── vendor/             ← vendored Python packages
-├── tracking/           ← ephemeral tracking JSONs
+├── tracking/           ← ephemeral tracking SQLite DBs
 └── logs/               ← log files
 ```
 
@@ -190,6 +179,3 @@ Check `s3://bucket/migration-tracking/*.json` to monitor progress:
 
 **"Skipping /data/reports — already covered by parent /data"**  
 → Normal behavior. Nested folders are deduplicated to avoid double-migration.
-
-**Interrupted migration**  
-→ Just re-run `./run.sh`. It resumes from where it left off using the local tracking file.
