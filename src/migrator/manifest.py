@@ -14,7 +14,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Optional, List, Tuple
 
-from migrator.types import ManifestContext
+from migrator.models import ManifestContext
 
 
 logger = logging.getLogger("migrator.manifest")
@@ -163,6 +163,20 @@ def set_status(ctx: ManifestContext, status: str) -> None:
         if status in (STATUS_COMPLETED, STATUS_FAILED):
             ctx.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('completed_at', ?)", (_now_iso(),))
         ctx.conn.commit()
+
+
+def get_last_completed_at(ctx: ManifestContext) -> Optional[datetime]:
+    """Get the timestamp of the last successful migration."""
+    with ctx.lock:
+        cursor = ctx.conn.cursor()
+        cursor.execute("SELECT value FROM meta WHERE key = 'completed_at'")
+        row = cursor.fetchone()
+        if row:
+            try:
+                return datetime.fromisoformat(row[0])
+            except ValueError:
+                pass
+    return None
 
 
 def get_failed_count(ctx: ManifestContext) -> int:

@@ -11,3 +11,13 @@ folders:
   # One-time jobs (will run exactly once per daemon boot)
   - source: /archive/logs
     target: archive/logs
+
+  # Append-Only Predictable Sync (For massive flat directories)
+  - source: /data/flat_history
+    target: flat_history
+    cron: "0 * * * *"
+    mirror_deletions: false
+    # Generates report_20260622_0001.csv to report_20260622_5000.csv
+    filename_template: "report_{date:%Y%m%d}_{seq:1-5000:04d}.csv"
+    schedule_lookback_days: 15
+    initial_lookback_days: 7300

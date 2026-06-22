@@ -6,14 +6,16 @@ Coordinates the folder-by-folder migration lifecycle:
 """
 
 import logging
+import math
 import posixpath
 import time
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from migrator.config import AppConfig, SFTPConfig
-from migrator.types import S3Context, SFTPContext, ManifestContext
+from migrator.models import S3Context, SFTPContext, ManifestContext
 from migrator.s3_client import S3AuthError, S3UploadError, upload_stream, delete_object
 from migrator.sftp_client import (
     FileInfo,
@@ -21,6 +23,7 @@ from migrator.sftp_client import (
     create_sftp_context,
     close_sftp_context,
     iter_files,
+    iter_files_by_pattern,
     open_file
 )
 from migrator.manifest import (
@@ -39,7 +42,8 @@ from migrator.manifest import (
     set_status,
     all_successful,
     commit_manifest,
-    get_failed_count
+    get_failed_count,
+    get_last_completed_at
 )
 
 logger = logging.getLogger("migrator.transfer")
@@ -117,10 +121,31 @@ def _process_folder(
 
     manifest_ctx = load_or_create_manifest(tracking_dir, folder)
 
+    job = next((j for j in config.folders if j.path == folder), None)
+    mirror_deletions = job.mirror_deletions if job else True
+    filename_template = job.filename_template if job else None
+    
+    # Check if this is the first run by seeing if there's any file recorded yet
+    with manifest_ctx.lock:
+        cursor = manifest_ctx.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM files")
+        is_first_run = cursor.fetchone()[0] == 0
+
+    if is_first_run and job:
+        lookback_days = job.initial_lookback_days
+    else:
+        lookback_days = job.schedule_lookback_days if job else 15
+
+    last_completed = get_last_completed_at(manifest_ctx)
+    mtime_threshold = 0.0
+    if last_completed:
+        mtime_threshold = (last_completed - timedelta(minutes=30)).timestamp()
+
     set_status(manifest_ctx, STATUS_IN_PROGRESS)
     commit_manifest(manifest_ctx)
 
-    reset_seen_flags(manifest_ctx)
+    if mirror_deletions:
+        reset_seen_flags(manifest_ctx)
 
     consecutive_failures = 0
     max_consecutive = config.options.consecutive_failure_threshold
@@ -133,7 +158,10 @@ def _process_folder(
         commit_manifest(manifest_ctx)
         raise FatalMigrationError(f"SFTP connection failed: {e}") from e
 
-    file_generator = iter_files(sftp_ctx, folder)
+    if filename_template:
+        file_generator = iter_files_by_pattern(sftp_ctx, folder, filename_template, lookback_days)
+    else:
+        file_generator = iter_files(sftp_ctx, folder)
     
     with ThreadPoolExecutor(max_workers=config.options.max_workers) as pool:
         while True:
@@ -157,17 +185,26 @@ def _process_folder(
 
             to_transfer = []
             for fi in batch:
+                # If mtime is older than the last migration window, skip it entirely
+                if last_completed and fi.mtime < mtime_threshold:
+                    if mirror_deletions:
+                        mark_seen(manifest_ctx, fi.path)
+                    stats.skipped += 1
+                    continue
+
                 if needs_transfer(manifest_ctx, fi.path, fi.size, fi.mtime):
                     to_transfer.append(fi)
                 else:
-                    mark_seen(manifest_ctx, fi.path)
+                    if mirror_deletions:
+                        mark_seen(manifest_ctx, fi.path)
                     stats.skipped += 1
 
             if dry_run:
                 if to_transfer:
                     logger.info("DRY RUN — would transfer %d files in this batch", len(to_transfer))
                     for fi in to_transfer:
-                        mark_seen(manifest_ctx, fi.path) # still mark seen so it doesn't get deleted
+                        if mirror_deletions:
+                            mark_seen(manifest_ctx, fi.path) # still mark seen so it doesn't get deleted
                 continue
 
             futures = []
@@ -248,17 +285,18 @@ def _process_folder(
     close_sftp_context(sftp_ctx)
 
     # Mirror sync deletions
-    to_delete = get_unseen_success_files(manifest_ctx)
-    if dry_run and to_delete:
-        logger.info("DRY RUN — would delete %d missing files from S3", len(to_delete))
-    elif to_delete:
-        for path, s3_key in to_delete:
-            try:
-                delete_object(s3_ctx, s3_key)
-                remove_file(manifest_ctx, path)
-            except Exception as e:
-                logger.error("Failed to delete orphaned object %s from S3: %s", s3_key, e)
-    commit_manifest(manifest_ctx)
+    if mirror_deletions:
+        to_delete = get_unseen_success_files(manifest_ctx)
+        if dry_run and to_delete:
+            logger.info("DRY RUN — would delete %d missing files from S3", len(to_delete))
+        elif to_delete:
+            for path, s3_key in to_delete:
+                try:
+                    delete_object(s3_ctx, s3_key)
+                    remove_file(manifest_ctx, path)
+                except Exception as e:
+                    logger.error("Failed to delete orphaned object %s from S3: %s", s3_key, e)
+        commit_manifest(manifest_ctx)
 
     if all_successful(manifest_ctx):
         set_status(manifest_ctx, STATUS_COMPLETED)

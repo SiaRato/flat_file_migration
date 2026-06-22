@@ -16,7 +16,7 @@ from botocore.exceptions import (
 )
 
 from migrator.config import S3Config
-from migrator.types import S3Context
+from migrator.models import S3Context
 
 
 logger = logging.getLogger("migrator.s3")

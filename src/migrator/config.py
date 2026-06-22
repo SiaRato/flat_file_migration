@@ -52,6 +52,10 @@ class FolderJob:
     path: str
     target: str
     cron_expr: Optional[str] = None
+    mirror_deletions: bool = True
+    filename_template: Optional[str] = None
+    schedule_lookback_days: int = 15
+    initial_lookback_days: int = 7300
 
 
 @dataclass
@@ -188,6 +192,10 @@ def _parse_folders_yaml(folders_path: str) -> List[FolderJob]:
         source = item.get("source")
         target = item.get("target")
         cron = item.get("cron")
+        mirror_deletions = item.get("mirror_deletions", True)
+        filename_template = item.get("filename_template")
+        schedule_lookback_days = item.get("schedule_lookback_days", 15)
+        initial_lookback_days = item.get("initial_lookback_days", 7300)
 
         if not source or not target:
             raise ConfigError(f"Folder entry missing required 'source' or 'target': {item}")
@@ -198,7 +206,11 @@ def _parse_folders_yaml(folders_path: str) -> List[FolderJob]:
         raw_jobs.append(FolderJob(
             path=str(source),
             target=str(target),
-            cron_expr=str(cron) if cron else None
+            cron_expr=str(cron) if cron else None,
+            mirror_deletions=bool(mirror_deletions),
+            filename_template=str(filename_template) if filename_template else None,
+            schedule_lookback_days=int(schedule_lookback_days),
+            initial_lookback_days=int(initial_lookback_days)
         ))
 
     if not raw_jobs:

@@ -12,7 +12,8 @@ from typing import IO, List, Optional, Generator
 import paramiko
 
 from migrator.config import SFTPConfig
-from migrator.types import SFTPContext
+from migrator.models import SFTPContext
+from migrator.pattern import generate_filenames
 
 
 logger = logging.getLogger("migrator.sftp")
@@ -87,6 +88,28 @@ def iter_files(ctx: SFTPContext, folder: str) -> Generator[FileInfo, None, None]
         raise SFTPConnectionError("Not connected to SFTP server")
 
     yield from _iter_walk(ctx, folder)
+
+
+def iter_files_by_pattern(ctx: SFTPContext, folder: str, pattern: str, lookback_days: int) -> Generator[FileInfo, None, None]:
+    """Yield files by predicting their paths instead of listing the directory."""
+    if not ctx.sftp:
+        raise SFTPConnectionError("Not connected to SFTP server")
+        
+    for filename in generate_filenames(pattern, lookback_days):
+        full_path = f"{folder.rstrip('/')}/{filename}"
+        try:
+            attr = ctx.sftp.stat(full_path)
+            if stat.S_ISREG(attr.st_mode):
+                yield FileInfo(
+                    path=full_path,
+                    size=attr.st_size,
+                    mtime=attr.st_mtime,
+                )
+        except FileNotFoundError:
+            # Sequence numbers or dates might not exist, skip gracefully
+            pass
+        except IOError as e:
+            logger.error("Error stat-ing file %s: %s", full_path, e)
 
 
 def _iter_walk(ctx: SFTPContext, path: str) -> Generator[FileInfo, None, None]:

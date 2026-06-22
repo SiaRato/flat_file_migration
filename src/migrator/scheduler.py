@@ -10,7 +10,7 @@ import time
 from typing import List, Optional
 
 from migrator.config import AppConfig, FolderJob
-from migrator.types import SchedulerContext, S3Context
+from migrator.models import SchedulerContext, S3Context
 from migrator.s3_client import S3AuthError, create_s3_context
 from migrator.transfer import _process_folder, _resolve_tracking_dir, MigrationStats, FatalMigrationError
 
