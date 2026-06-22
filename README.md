@@ -17,12 +17,12 @@ Designed for deployment on **air-gapped midman servers** with network access lim
 - **Database Tracking** — backed by local SQLite database to support large scale migration.
 - **Daemon Scheduler** — running `./run.sh` launches the persistent scheduler. It reads standard cron schedules directly from `folders.yaml` and manages its own internal triggers via a SQLite scheduling database.
 - **Strict Mirror Sync** — automatically deletes files on S3 that were removed from the SFTP server, keeping the destination perfectly in sync.
-- **Streaming SFTP Generator** — pulls file metadata from SFTP server over the network one-by-one, keeping memory usage flat regardless of folder size.
+- **Streaming SFTP Generator & Predictable Sync** — pulls file metadata from SFTP over the network one-by-one, or uses template-based prediction to avoid slow `ls` operations entirely, keeping memory usage flat regardless of folder size.
 - **Stream-based transfer** — files are streamed directly from SFTP to S3 without touching local disk.
 - **Concurrent transfers** — configurable thread pool for parallel file uploads within each folder.
 - **Multipart uploads** — automatic for files larger than a configurable threshold (default: 100 MB).
 - **Smart change detection** — skips files that haven't changed (size + mtime comparison).
-- **Stateless Resilience** — tracking history is downloaded from S3 at the start, making the midman server completely disposable.
+- **Persistent Local Tracking** — tracking history is stored in a local SQLite database, avoiding reliance on remote state and providing extremely fast state recovery.
 
 ## How It Scales
 
@@ -70,7 +70,7 @@ cd migrator
 
 # Create your configuration
 cp config.example.yaml config.yaml    # edit with your settings
-cp folders.example.txt folders.yaml   # edit with your SFTP folder and target paths
+cp folders.example.yaml folders.yaml   # edit with your SFTP folder and target paths
 ```
 
 ## Configuration
@@ -115,6 +115,15 @@ folders:
   # One-time jobs (will run exactly once per daemon boot)
   - source: /archive/logs
     target: archive/logs
+
+  # Append-Only Predictable Sync (For massive flat directories)
+  - source: /data/flat_history
+    target: flat_history
+    cron: "0 * * * *"
+    mirror_deletions: false
+    filename_template: "report_{date:%Y%m%d}_{seq:1-5000:04d}.csv"
+    schedule_lookback_days: 15
+    initial_lookback_days: 7300
 ```
 
 ### Environment Variables
@@ -220,7 +229,7 @@ Tracking is managed entirely locally in the `tracking/` directory. You can query
 ├── folders.yaml        ← SFTP folders and S3 targets
 ├── src/migrator/       ← source code
 ├── vendor/             ← vendored Python packages
-├── tracking/           ← ephemeral tracking SQLite DBs
+├── tracking/           ← persistent local tracking SQLite DBs
 └── logs/               ← log files
 ```
 
@@ -231,7 +240,7 @@ If you are a junior developer or simply looking to understand, modify, or extend
 - `__main__.py`: The entry point. Parses CLI arguments (`--folder`, `--dry-run`) and launches either a single directory run or the persistent daemon scheduler.
 - `scheduler.py`: The daemon scheduler. Uses a local SQLite database to manage cron jobs and one-time tasks, triggering folder transfers when scheduled.
 - `transfer.py`: The core orchestrator. Contains the business logic for concurrency, consuming the SFTP generator, batching uploads, and deleting orphaned files on S3.
-- `s3_client.py`: AWS Boto3 wrapper. Handles multipart chunking, credentials validation, and uploading the binary SQLite tracking databases.
+- `s3_client.py`: AWS Boto3 wrapper. Handles multipart chunking and credentials validation.
 - `sftp_client.py`: Paramiko wrapper. Connects to SFTP and recursively walks directories using generators to ensure memory usage remains flat regardless of folder depth.
 - `manifest.py`: SQLite wrapper. Tracks local file states (`seen`, `size`, `mtime`) to ensure we only transfer new or changed files. Replaces in-memory JSON to guarantee infinite horizontal scale.
 - `config.py`: Parses `config.yaml`, validates crontab expressions, and securely loads environment variables.

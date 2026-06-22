@@ -14,7 +14,7 @@ The application operates as a persistent daemon scheduler across a list of direc
 
 1. **State Bootstrapping**: The tool initializes or loads a local SQLite tracking database (`tracking/{folder}.db`).
 2. **Daemon Scheduling**: A central `scheduler.db` manages the exact `next_run` timestamp for each folder. Folders without a cron expression are run exactly once per daemon boot to check for missed updates.
-3. **SFTP Discovery (Streaming)**: Connects to the SFTP server and uses a Python generator to yield files one-by-one, ensuring constant minimal memory usage regardless of folder depth.
+3. **SFTP Discovery (Streaming & Predictable)**: Connects to the SFTP server and uses a Python generator to yield files one-by-one. For massive flat directories, supports "Predictable Sync" via filename templates to avoid expensive remote directory listing operations.
 4. **Change Detection**: Batches of files are instantly compared against the local SQLite database. Files with matching `size` and `mtime` (Modification Time) are skipped and marked as "seen".
 5. **Concurrent Transfer**: Batches of queued files are passed to a `ThreadPoolExecutor` to stream multiple files in parallel to S3.
 6. **Mirror Deletions**: After the SFTP generator finishes, any file in the SQLite database that was not "seen" during discovery is identified as an orphaned file. These orphans are deleted from S3 and purged from the database.
@@ -27,7 +27,7 @@ File transfers do not write to the midman's disk.
 - **Thread Safety**: Paramiko SFTP connections are inherently not thread-safe. To resolve this, each worker thread spawns its own distinct SFTP connection while sharing a thread-safe Boto3 client.
 
 ## 4. State Management (SQLite Database)
-The system's tracking state is managed through a local SQLite database, replacing in-memory JSON to guarantee infinite horizontal scale. Memory footprint is flat, enabling the processing of millions of files.
+The system's tracking state is managed persistently through a local SQLite database (S3 tracking has been removed to simplify architecture and rely exclusively on local storage). Memory footprint is flat, enabling the processing of millions of files with infinite horizontal scale.
 
 **Database Optimizations:**
 - `path` is the Primary Key, triggering automatic B-Tree indexing for microsecond lookups.
@@ -56,7 +56,7 @@ Located in `src/migrator/`:
 
 ## 7. Configuration Specifications
 - `config.yaml`: Contains connection endpoints, bucket details, and operational thresholds (`max_workers`, `multipart_chunk_mb`).
-- `folders.yaml`: A YAML configuration file mapping source directories to S3 targets, with optional crontab prefixes.
+- `folders.yaml`: A YAML configuration file mapping source directories to S3 targets, supporting optional crontab schedules, `mirror_deletions` toggles, and predictable sync configurations (`filename_template`).
 - Environment Variables: `SFTP_PASSWORD`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` are strictly injected via environment for security.
 
 ## 8. Extension Points & Design Rules for Future Sessions
