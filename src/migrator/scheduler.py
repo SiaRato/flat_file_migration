@@ -40,7 +40,7 @@ def _init_db(ctx: SchedulerContext):
         )
 
 def sync_jobs(ctx: SchedulerContext, jobs: List[FolderJob]):
-    """Upsert jobs from folders.txt into the database."""
+    """Upsert jobs from folders.yaml into the database."""
     now = time.time()
     
     with ctx.conn:
@@ -137,7 +137,7 @@ def run_daemon(config: AppConfig, folders_path: str, dry_run: bool) -> int:
     db_path = os.path.join(tracking_dir, "scheduler.db")
     sched_ctx = create_scheduler_context(db_path)
 
-    # Boot phase: sync jobs from folders.txt into DB
+    # Boot phase: sync jobs from folders.yaml into DB
     sync_jobs(sched_ctx, config.folders)
     
     # Initialize S3 client once for the daemon
@@ -155,8 +155,14 @@ def run_daemon(config: AppConfig, folders_path: str, dry_run: bool) -> int:
             ready_jobs = get_ready_jobs(sched_ctx, now)
             
             for path in ready_jobs:
+                folder_job = next((j for j in config.folders if j.path == path), None)
+                if not folder_job:
+                    logger.warning("Job for %s not found in config, skipping.", path)
+                    continue
+                target = folder_job.target
+
                 logger.info("=" * 60)
-                logger.info("DAEMON: Executing job for %s", path)
+                logger.info("DAEMON: Executing job for %s -> %s", path, target)
                 logger.info("=" * 60)
                 
                 cron_expr = get_job_cron(sched_ctx, path)
@@ -169,6 +175,7 @@ def run_daemon(config: AppConfig, folders_path: str, dry_run: bool) -> int:
                     # Because they might be picking up where they left off.
                     _process_folder(
                         folder=path,
+                        target=target,
                         config=config,
                         s3_ctx=s3_ctx,
                         tracking_dir=tracking_dir,

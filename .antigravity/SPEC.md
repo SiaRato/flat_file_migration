@@ -10,16 +10,15 @@
 
 ## 3. Core Logic & Lifecycle
 ### 3.1 Folder Processing Workflow
-The application operates as a persistent daemon scheduler across a list of directories defined in `folders.txt`. These directories can include optional standard 5-part crontab expressions.
+The application operates as a persistent daemon scheduler across a list of directories defined in `folders.yaml`. These directories can include optional standard 5-part crontab expressions.
 
-1. **State Bootstrapping**: The tool downloads the historical SQLite tracking database (`tracking/{folder}.db`) from S3 or initializes a new local database.
+1. **State Bootstrapping**: The tool initializes or loads a local SQLite tracking database (`tracking/{folder}.db`).
 2. **Daemon Scheduling**: A central `scheduler.db` manages the exact `next_run` timestamp for each folder. Folders without a cron expression are run exactly once per daemon boot to check for missed updates.
 3. **SFTP Discovery (Streaming)**: Connects to the SFTP server and uses a Python generator to yield files one-by-one, ensuring constant minimal memory usage regardless of folder depth.
 4. **Change Detection**: Batches of files are instantly compared against the local SQLite database. Files with matching `size` and `mtime` (Modification Time) are skipped and marked as "seen".
-5. **S3 Tracking Start**: Uploads the SQLite database to S3 under the tracking prefix with an `in_progress` status.
-6. **Concurrent Transfer**: Batches of queued files are passed to a `ThreadPoolExecutor` to stream multiple files in parallel to S3.
-7. **Mirror Deletions**: After the SFTP generator finishes, any file in the SQLite database that was not "seen" during discovery is identified as an orphaned file. These orphans are deleted from S3 and purged from the database.
-8. **S3 Tracking Finalize**: Updates the database status to `completed` or `failed` and uploads the final `.db` binary to S3.
+5. **Concurrent Transfer**: Batches of queued files are passed to a `ThreadPoolExecutor` to stream multiple files in parallel to S3.
+6. **Mirror Deletions**: After the SFTP generator finishes, any file in the SQLite database that was not "seen" during discovery is identified as an orphaned file. These orphans are deleted from S3 and purged from the database.
+7. **Finalize**: Updates the database status to `completed` or `failed`.
 
 ### 3.2 File Transfer Mechanics (Streaming)
 File transfers do not write to the midman's disk. 
@@ -35,7 +34,7 @@ The system's tracking state is managed through a local SQLite database, replacin
 - `seen` and `status` utilize a composite index to instantly find deleted orphaned files without table scans.
 - `PRAGMA journal_mode=WAL` is active to allow concurrent threads to write without locking.
 
-**Folder-Level S3 Statuses:**
+**Folder-Level Local Statuses:**
 - `in_progress`: Actively migrating. If a script halts unexpectedly, the status remains here, indicating a crash.
 - `completed`: 100% of files within the folder migrated successfully.
 - `failed`: Completed the pass, but one or more files encountered errors.
@@ -50,14 +49,14 @@ Located in `src/migrator/`:
 - `__main__.py`: CLI argument parsing (supports `--folder`, `--dry-run`), and entry point execution. Defaults to launching the daemon scheduler.
 - `scheduler.py`: SQLite-backed daemon scheduler for managing cron jobs and one-time tasks.
 - `transfer.py`: Orchestrator holding the core business logic (concurrency, batched generator consumption, mirror deletions).
-- `s3_client.py`: AWS Boto3 abstraction handling multipart chunking, auth validation, and binary tracking db uploads.
+- `s3_client.py`: AWS Boto3 abstraction handling multipart chunking and auth validation.
 - `sftp_client.py`: Paramiko abstraction handling recursive directory walks via generators.
 - `manifest.py`: SQLite wrapper for tracking local file states and executing queries.
 - `config.py`: YAML parsing, crontab expression validation, and environment variable hydration.
 
 ## 7. Configuration Specifications
 - `config.yaml`: Contains connection endpoints, bucket details, and operational thresholds (`max_workers`, `multipart_chunk_mb`).
-- `folders.txt`: A plain text file defining the migration queue. Supports optional 5-part crontab prefixes (e.g. `0 * * * * /data/reports`).
+- `folders.yaml`: A YAML configuration file mapping source directories to S3 targets, with optional crontab prefixes.
 - Environment Variables: `SFTP_PASSWORD`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` are strictly injected via environment for security.
 
 ## 8. Extension Points & Design Rules for Future Sessions

@@ -1,3 +1,0 @@
-/data/reports
-/data/exports/2024
-/archive/logs

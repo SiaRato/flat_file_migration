@@ -1,9 +1,9 @@
 """CLI entry point for the SFTP-to-S3 migrator.
 
 Usage:
-    python -m migrator --config config.yaml --folders folders.txt
+    python -m migrator --config config.yaml --folders folders.yaml
     python -m migrator --dry-run
-    python -m migrator --folder /path/to/specific
+    python -m migrator --folder /path/to/specific --target my/s3/target
     python -m migrator --log-level DEBUG
 """
 
@@ -28,13 +28,18 @@ def main() -> int:
     )
     parser.add_argument(
         "--folders",
-        default="folders.txt",
-        help="Path to folders list file (default: folders.txt)",
+        default="folders.yaml",
+        help="Path to folders list file (default: folders.yaml)",
     )
     parser.add_argument(
         "--folder",
         default=None,
-        help="Override folders.txt and run on a single specific folder once",
+        help="Override folders.yaml and run on a single specific folder once. Requires --target.",
+    )
+    parser.add_argument(
+        "--target",
+        default=None,
+        help="S3 target path to use with --folder.",
     )
     parser.add_argument(
         "--dry-run",
@@ -60,7 +65,7 @@ def main() -> int:
 
     # Load config first (before logging, since config has log_file setting)
     try:
-        config = load_config(config_path, folders_path, base_dir, args.folder)
+        config = load_config(config_path, folders_path, base_dir, args.folder, args.target)
     except ConfigError as e:
         # Can't use logger yet — print to stderr
         print(f"FATAL: Configuration error: {e}", file=sys.stderr)
@@ -104,6 +109,7 @@ def main() -> int:
         try:
             _process_folder(
                 folder=args.folder,
+                target=config.folders[0].target,
                 config=config,
                 s3_ctx=s3_ctx,
                 tracking_dir=tracking_dir,

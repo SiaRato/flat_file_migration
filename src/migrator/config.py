@@ -34,7 +34,6 @@ class S3Config:
     bucket: str
     prefix: str
     region: str
-    tracking_prefix: str
 
 
 @dataclass
@@ -51,6 +50,7 @@ class OptionsConfig:
 @dataclass
 class FolderJob:
     path: str
+    target: str
     cron_expr: Optional[str] = None
 
 
@@ -63,14 +63,15 @@ class AppConfig:
     base_dir: str = ""
 
 
-def load_config(config_path: str, folders_path: str, base_dir: str, folder_override: Optional[str] = None) -> AppConfig:
+def load_config(config_path: str, folders_path: str, base_dir: str, folder_override: Optional[str] = None, target_override: Optional[str] = None) -> AppConfig:
     """Load and validate the application configuration.
 
     Args:
         config_path: Absolute path to config.yaml.
-        folders_path: Absolute path to folders.txt.
+        folders_path: Absolute path to folders.yaml.
         base_dir: Deployment base directory (for resolving relative paths).
-        folder_override: Optional single folder to run instead of reading folders.txt.
+        folder_override: Optional single folder to run instead of reading folders.yaml.
+        target_override: Optional single target to use when overriding.
 
     Returns:
         Validated AppConfig instance.
@@ -110,7 +111,6 @@ def load_config(config_path: str, folders_path: str, base_dir: str, folder_overr
         bucket=s3_raw.get("bucket", ""),
         prefix=s3_raw.get("prefix", ""),
         region=s3_raw.get("region", "us-east-1"),
-        tracking_prefix=s3_raw.get("tracking_prefix", "migration-tracking"),
     )
 
     if not s3.bucket:
@@ -128,11 +128,13 @@ def load_config(config_path: str, folders_path: str, base_dir: str, folder_overr
         log_file=opts_raw.get("log_file"),
     )
 
-    # Parse folders.txt or use override
+    # Parse folders.yaml or use override
     if folder_override:
-        folders = [FolderJob(path=folder_override, cron_expr=None)]
+        if not target_override:
+            raise ConfigError("target_override must be provided if folder_override is used")
+        folders = [FolderJob(path=folder_override, target=target_override, cron_expr=None)]
     else:
-        folders = _parse_folders(folders_path)
+        folders = _parse_folders_yaml(folders_path)
 
     return AppConfig(
         sftp=sftp,
@@ -143,17 +145,17 @@ def load_config(config_path: str, folders_path: str, base_dir: str, folder_overr
     )
 
 
-def _parse_folders(folders_path: str) -> List[FolderJob]:
-    """Parse folders.txt, skipping blanks and DONE lines, then deduplicate.
+def _parse_folders_yaml(folders_path: str) -> List[FolderJob]:
+    """Parse folders.yaml and validate.
 
     Args:
-        folders_path: Path to the folders.txt file.
+        folders_path: Path to the folders.yaml file.
 
     Returns:
-        Deduplicated list of FolderJob instances.
+        Validated list of FolderJob instances.
 
     Raises:
-        ConfigError: If folders.txt is missing or contains invalid cron expressions.
+        ConfigError: If folders.yaml is missing, invalid, or contains overlapping folders.
     """
     if not os.path.isfile(folders_path):
         raise ConfigError(f"Folders file not found: {folders_path}")
@@ -165,59 +167,63 @@ def _parse_folders(folders_path: str) -> List[FolderJob]:
         logger.warning("croniter is not installed, cron expressions will not be parsed.")
 
     with open(folders_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+        try:
+            raw = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            raise ConfigError(f"Invalid YAML format in {folders_path}: {e}")
+
+    if not raw or not isinstance(raw, dict) or "folders" not in raw:
+        logger.info("No 'folders' list found in %s — nothing to migrate", folders_path)
+        return []
+
+    folder_list = raw.get("folders", [])
+    if not isinstance(folder_list, list):
+        raise ConfigError("'folders' must be a list in YAML config")
 
     raw_jobs = []
-    for line in lines:
-        stripped = line.strip()
-        # Skip blank lines, comments, and completed folders
-        if not stripped or stripped.startswith("#"):
-            continue
+    for item in folder_list:
+        if not isinstance(item, dict):
+            raise ConfigError(f"Invalid folder entry in YAML: {item}")
+        
+        source = item.get("source")
+        target = item.get("target")
+        cron = item.get("cron")
 
-        parts = stripped.split()
-        if len(parts) >= 6:
-            potential_cron = " ".join(parts[:5])
-            path = " ".join(parts[5:])
-            if croniter and croniter.is_valid(potential_cron):
-                raw_jobs.append(FolderJob(path=path, cron_expr=potential_cron))
-                continue
-            elif croniter and not croniter.is_valid(potential_cron):
-                # We know croniter is installed, and it rejected the syntax. Let's raise an error.
-                # However, maybe the user just has a directory path with spaces that happens to have 6 words.
-                # We will check if the first 5 parts are strictly cron-like.
-                # A hard fail is best here for validation.
-                raise ConfigError(f"Invalid cron expression in folders.txt: '{potential_cron}' for path '{path}'")
+        if not source or not target:
+            raise ConfigError(f"Folder entry missing required 'source' or 'target': {item}")
 
-        # No cron prefix found or croniter missing, treat as one-time job
-        raw_jobs.append(FolderJob(path=stripped, cron_expr=None))
+        if cron and croniter and not croniter.is_valid(cron):
+            raise ConfigError(f"Invalid cron expression '{cron}' for path '{source}'")
+
+        raw_jobs.append(FolderJob(
+            path=str(source),
+            target=str(target),
+            cron_expr=str(cron) if cron else None
+        ))
 
     if not raw_jobs:
         logger.info("No pending folders found in %s — nothing to migrate", folders_path)
         return []
 
-    # Deduplicate nested folders
-    deduped = _deduplicate_nested(raw_jobs)
+    # Validate nested folders
+    valid_jobs = _validate_no_overlaps(raw_jobs)
 
-    logger.info(
-        "Loaded %d folder(s) to migrate (%d removed as nested duplicates)",
-        len(deduped),
-        len(raw_jobs) - len(deduped),
-    )
+    logger.info("Loaded %d folder(s) to migrate", len(valid_jobs))
 
-    return deduped
+    return valid_jobs
 
 
-def _deduplicate_nested(jobs: List[FolderJob]) -> List[FolderJob]:
-    """Remove folders that are subfolders of other folders in the list.
-
-    Since the script traverses recursively, a child folder is already
-    covered by its parent. Keeps only top-level (non-overlapping) folders.
+def _validate_no_overlaps(jobs: List[FolderJob]) -> List[FolderJob]:
+    """Ensure no folders overlap with each other.
 
     Args:
         jobs: Raw list of FolderJobs.
 
     Returns:
-        Deduplicated list with only top-level FolderJobs.
+        Validated list of FolderJobs.
+
+    Raises:
+        ConfigError: If any folder is a subfolder of another, or if there are duplicates.
     """
     # Normalize paths
     for j in jobs:
@@ -228,24 +234,14 @@ def _deduplicate_nested(jobs: List[FolderJob]) -> List[FolderJob]:
 
     kept = []
     for job in jobs:
-        is_nested = False
         for parent in kept:
             # Check if folder is a subfolder of parent
             if job.path == parent.path:
-                is_nested = True
-                logger.warning(
-                    "Skipping duplicate folder: %s", job.path
-                )
-                break
+                raise ConfigError(f"Duplicate folder source detected: '{job.path}'")
             if job.path.startswith(parent.path + "/"):
-                is_nested = True
-                logger.warning(
-                    "Skipping %s — already covered by parent %s", job.path, parent.path
-                )
-                break
+                raise ConfigError(f"Overlapping folders detected: '{job.path}' is covered by parent '{parent.path}'")
 
-        if not is_nested:
-            kept.append(job)
+        kept.append(job)
 
     return kept
 

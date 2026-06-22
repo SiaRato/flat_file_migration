@@ -15,7 +15,6 @@ from datetime import datetime, timezone
 from typing import Any, Optional, List, Tuple
 
 from migrator.types import ManifestContext
-import migrator.s3_client as s3_client
 
 
 logger = logging.getLogger("migrator.manifest")
@@ -32,22 +31,12 @@ FILE_STATUS_PENDING = "pending"
 
 
 def load_or_create_manifest(
-    tracking_dir: str, sftp_folder: str, s3_ctx: Optional[Any] = None
+    tracking_dir: str, sftp_folder: str
 ) -> ManifestContext:
-    """Load an existing database from disk or S3, or create a new one."""
+    """Load an existing database from disk or create a new one."""
     os.makedirs(tracking_dir, exist_ok=True)
     filename = _sanitize_folder_name(sftp_folder) + ".db"
     tracking_path = os.path.join(tracking_dir, filename)
-
-    if s3_ctx:
-        try:
-            s3_data_bytes = s3_client.download_tracking_bytes(s3_ctx, sftp_folder)
-            if s3_data_bytes:
-                with open(tracking_path, "wb") as f:
-                    f.write(s3_data_bytes)
-                logger.info("Downloaded and applied tracking DB from S3 for %s", sftp_folder)
-        except Exception as e:
-            logger.warning("Failed to fetch tracking DB from S3 for %s: %s", sftp_folder, e)
 
     lock = threading.Lock()
     conn = sqlite3.connect(tracking_path, check_same_thread=False)

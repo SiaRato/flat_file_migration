@@ -1,13 +1,12 @@
 """Transfer orchestrator (Functional).
 
 Coordinates the folder-by-folder migration lifecycle:
-    1. Upload 'in_progress' tracking to S3
-    2. Migrate files concurrently (SFTP → S3 streaming) using Map/Reduce
-    3. Upload 'completed' or 'failed' tracking to S3
-    4. Clean up local tracking + mark folder done
+    1. Migrate files concurrently (SFTP → S3 streaming) using Map/Reduce
+    2. Track folder progress in local SQLite
 """
 
 import logging
+import posixpath
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -15,7 +14,7 @@ from typing import List, Optional, Tuple
 
 from migrator.config import AppConfig, SFTPConfig
 from migrator.types import S3Context, SFTPContext, ManifestContext
-from migrator.s3_client import S3AuthError, S3UploadError, upload_tracking_db, upload_stream, delete_object
+from migrator.s3_client import S3AuthError, S3UploadError, upload_stream, delete_object
 from migrator.sftp_client import (
     FileInfo,
     SFTPConnectionError,
@@ -98,18 +97,12 @@ def _resolve_tracking_dir(base_dir: str) -> str:
     return tracking_dir
 
 
-def _try_upload_tracking(s3_ctx: S3Context, tracking_path: str, sftp_folder: str) -> None:
-    try:
-        upload_tracking_db(s3_ctx, tracking_path, sftp_folder)
-    except Exception as e:
-        logger.error(
-            "Failed to upload tracking DB (best-effort) for %s: %s",
-            sftp_folder, e,
-        )
+
 
 
 def _process_folder(
     folder: str,
+    target: str,
     config: AppConfig,
     s3_ctx: S3Context,
     tracking_dir: str,
@@ -122,11 +115,10 @@ def _process_folder(
     if stats is None:
         stats = MigrationStats(start_time=time.time())
 
-    manifest_ctx = load_or_create_manifest(tracking_dir, folder, s3_ctx)
+    manifest_ctx = load_or_create_manifest(tracking_dir, folder)
 
     set_status(manifest_ctx, STATUS_IN_PROGRESS)
     commit_manifest(manifest_ctx)
-    _try_upload_tracking(s3_ctx, manifest_ctx.tracking_path, folder)
 
     reset_seen_flags(manifest_ctx)
 
@@ -139,7 +131,6 @@ def _process_folder(
     except SFTPConnectionError as e:
         set_status(manifest_ctx, STATUS_FAILED)
         commit_manifest(manifest_ctx)
-        _try_upload_tracking(s3_ctx, manifest_ctx.tracking_path, folder)
         raise FatalMigrationError(f"SFTP connection failed: {e}") from e
 
     file_generator = iter_files(sftp_ctx, folder)
@@ -156,7 +147,6 @@ def _process_folder(
             except SFTPConnectionError as e:
                 set_status(manifest_ctx, STATUS_FAILED)
                 commit_manifest(manifest_ctx)
-                _try_upload_tracking(s3_ctx, manifest_ctx.tracking_path, folder)
                 close_sftp_context(sftp_ctx)
                 raise FatalMigrationError(f"SFTP connection lost during listing: {e}") from e
 
@@ -182,7 +172,14 @@ def _process_folder(
 
             futures = []
             for fi in to_transfer:
-                s3_key = fi.path.lstrip("/")
+                try:
+                    relative_path = posixpath.relpath(fi.path, folder)
+                except ValueError:
+                    # Fallback if paths are disjoint
+                    relative_path = fi.path.lstrip("/")
+                
+                s3_key = posixpath.join(target, relative_path)
+                
                 future = pool.submit(
                     _transfer_single_file_map,
                     sftp_config=config.sftp,
@@ -225,7 +222,6 @@ def _process_folder(
                         if isinstance(e, (S3AuthError, SFTPConnectionError)):
                             set_status(manifest_ctx, STATUS_FAILED)
                             commit_manifest(manifest_ctx)
-                            _try_upload_tracking(s3_ctx, manifest_ctx.tracking_path, folder)
                             for pending_future in futures:
                                 pending_future.cancel()
                             close_sftp_context(sftp_ctx)
@@ -238,7 +234,6 @@ def _process_folder(
                         if consecutive_failures >= max_consecutive:
                             set_status(manifest_ctx, STATUS_FAILED)
                             commit_manifest(manifest_ctx)
-                            _try_upload_tracking(s3_ctx, manifest_ctx.tracking_path, folder)
                             for pending_future in futures:
                                 pending_future.cancel()
                             close_sftp_context(sftp_ctx)
@@ -268,14 +263,12 @@ def _process_folder(
     if all_successful(manifest_ctx):
         set_status(manifest_ctx, STATUS_COMPLETED)
         commit_manifest(manifest_ctx)
-        _try_upload_tracking(s3_ctx, manifest_ctx.tracking_path, folder)
             
         stats.folders_completed += 1
         logger.info("✓ Folder completed: %s", folder)
     else:
         set_status(manifest_ctx, STATUS_FAILED)
         commit_manifest(manifest_ctx)
-        _try_upload_tracking(s3_ctx, manifest_ctx.tracking_path, folder)
 
         stats.folders_failed += 1
         logger.warning(

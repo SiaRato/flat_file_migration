@@ -15,7 +15,7 @@ Designed for deployment on **air-gapped midman servers** with network access lim
 ## Features
 
 - **Database Tracking** — backed by local SQLite database to support large scale migration.
-- **Daemon Scheduler** — running `./run.sh` launches the persistent scheduler. It reads standard cron schedules directly from `folders.txt` and manages its own internal triggers via a SQLite scheduling database.
+- **Daemon Scheduler** — running `./run.sh` launches the persistent scheduler. It reads standard cron schedules directly from `folders.yaml` and manages its own internal triggers via a SQLite scheduling database.
 - **Strict Mirror Sync** — automatically deletes files on S3 that were removed from the SFTP server, keeping the destination perfectly in sync.
 - **Streaming SFTP Generator** — pulls file metadata from SFTP server over the network one-by-one, keeping memory usage flat regardless of folder size.
 - **Stream-based transfer** — files are streamed directly from SFTP to S3 without touching local disk.
@@ -70,7 +70,7 @@ cd migrator
 
 # Create your configuration
 cp config.example.yaml config.yaml    # edit with your settings
-cp folders.example.txt folders.txt    # edit with your SFTP folder paths
+cp folders.example.txt folders.yaml   # edit with your SFTP folder and target paths
 ```
 
 ## Configuration
@@ -88,7 +88,6 @@ s3:
   bucket: "my-migration-bucket"
   prefix: ""
   region: "us-east-1"
-  tracking_prefix: "migration-tracking"
 
 options:
   max_workers: 4
@@ -100,15 +99,22 @@ options:
   log_file: "logs/migrator.log"
 ```
 
-One SFTP folder path per line. You can optionally prefix lines with a standard 5-part crontab expression to schedule jobs:
+The `folders.yaml` configuration defines the source folders, their crontab schedule, and their target S3 mapping:
 
-```
-# Scheduled jobs
-0 2 * * * /data/exports/2024
-*/15 * * * * /data/reports
+```yaml
+folders:
+  # Scheduled jobs
+  - source: /data/exports/2024
+    cron: "0 2 * * *"
+    target: my_s3_prefix/2024
 
-# One-time jobs (will run exactly once per daemon boot)
-/archive/logs
+  - source: /data/reports
+    cron: "*/15 * * * *"
+    target: reports/daily
+
+  # One-time jobs (will run exactly once per daemon boot)
+  - source: /archive/logs
+    target: archive/logs
 ```
 
 ### Environment Variables
@@ -135,8 +141,8 @@ export AWS_SECRET_ACCESS_KEY=xxx
 # Run the persistent daemon scheduler (Default mode)
 ./run.sh
 
-# Override folders.txt and run a single specific folder manually
-./run.sh --folder /data/reports
+# Override folders.yaml and run a single specific folder manually
+./run.sh --folder /data/reports --target reports/daily
 
 # Verbose logging
 ./run.sh --log-level DEBUG
@@ -186,15 +192,12 @@ You can view the logs anytime using `journalctl -u migrator.service -f` or by ch
 
 ### Per-Folder Lifecycle
 
-1. **Load tracking** — downloads the historical SQLite tracking database from S3.
+1. **Load tracking** — initializes or loads the local SQLite tracking database.
 2. **Streaming Discovery** — uses a generator to stream files from the SFTP folder one by one.
 3. **Filter** — instantly queries the SQLite database to skip files already migrated (size + mtime match).
-4. **Upload `in_progress`** — pushes tracking DB to S3 to signal migration has started.
-5. **Transfer** — streams files from SFTP to S3 using batched concurrent workers.
-6. **Mirror Pruning** — identifies files missing from SFTP and gracefully deletes them from S3.
-7. **Finalize**:
-   - ✓ All files succeeded → upload `completed` tracking DB.
-   - ✗ Some files failed → upload `failed` tracking DB → keep local tracking for next run.
+4. **Transfer** — streams files from SFTP to S3 using batched concurrent workers.
+5. **Mirror Pruning** — identifies files missing from SFTP and gracefully deletes them from S3.
+6. **Finalize**: Updates the local tracking database to `completed` or `failed`.
 
 ### Error Handling
 
@@ -204,9 +207,9 @@ You can view the logs anytime using `journalctl -u migrator.service -f` or by ch
 | **Consecutive threshold** | 5+ files fail in a row | Halt program (systemic issue) |
 | **Per-file** | File permission denied, transient timeout | Retry with exponential backoff, then continue |
 
-### Tracking Status on S3
+### Tracking Status
 
-Check `s3://bucket/migration-tracking/*.db` to monitor progress. You can download these SQLite `.db` files and run queries locally to view deep statistics.
+Tracking is managed entirely locally in the `tracking/` directory. You can query the local SQLite `.db` files to view deep statistics.
 
 ## Deployment Structure
 
@@ -214,7 +217,7 @@ Check `s3://bucket/migration-tracking/*.db` to monitor progress. You can downloa
 /opt/migrator/
 ├── run.sh              ← launcher
 ├── config.yaml         ← your settings (no secrets)
-├── folders.txt         ← SFTP folders to migrate
+├── folders.yaml        ← SFTP folders and S3 targets
 ├── src/migrator/       ← source code
 ├── vendor/             ← vendored Python packages
 ├── tracking/           ← ephemeral tracking SQLite DBs
@@ -246,5 +249,5 @@ If you are a junior developer or simply looking to understand, modify, or extend
 **"N consecutive failures — systemic issue detected"**  
 → Check SFTP server status and network connectivity. Re-run after fixing.
 
-**"Skipping /data/reports — already covered by parent /data"**  
-→ Normal behavior. Nested folders are deduplicated to avoid double-migration.
+**"Overlapping folders detected..."**  
+→ Normal behavior. Nested and overlapping folders trigger a fatal error to avoid double-migration. Please fix your `folders.yaml`.

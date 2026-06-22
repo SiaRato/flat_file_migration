@@ -1,7 +1,6 @@
 """S3 client wrapper (Functional).
 
-Provides streaming uploads (regular and multipart) and tracking file uploads
-via boto3.
+Provides streaming uploads (regular and multipart) via boto3.
 """
 
 import io
@@ -207,66 +206,7 @@ def _upload_multipart(
         raise
 
 
-def upload_tracking_db(ctx: S3Context, db_path: str, sftp_folder: str) -> None:
-    """Upload a tracking DB to the tracking prefix in S3."""
-    from migrator.manifest import _sanitize_folder_name
 
-    folder_name = _sanitize_folder_name(sftp_folder)
-    tracking_key = (
-        f"{ctx.config.tracking_prefix.strip('/')}/{folder_name}.db"
-    )
-
-    try:
-        with open(db_path, "rb") as f:
-            data = f.read()
-            
-        ctx.client.put_object(
-            Bucket=ctx.config.bucket,
-            Key=tracking_key,
-            Body=data,
-            ContentType="application/octet-stream",
-        )
-        logger.info(
-            "Uploaded tracking DB to s3://%s/%s",
-            ctx.config.bucket, tracking_key,
-        )
-    except (NoCredentialsError, PartialCredentialsError) as e:
-        raise S3AuthError(f"AWS credentials error: {e}") from e
-    except ClientError as e:
-        error_code = e.response.get("Error", {}).get("Code", "")
-        if error_code in ("403", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
-            raise S3AuthError(f"S3 access denied: {e}") from e
-        raise S3UploadError(
-            f"Failed to upload tracking DB for {sftp_folder}: {e}"
-        ) from e
-
-
-def download_tracking_bytes(ctx: S3Context, sftp_folder: str) -> Optional[bytes]:
-    """Download tracking DB from S3."""
-    from migrator.manifest import _sanitize_folder_name
-    folder_name = _sanitize_folder_name(sftp_folder)
-    tracking_key = (
-        f"{ctx.config.tracking_prefix.strip('/')}/{folder_name}.db"
-    )
-
-    try:
-        response = ctx.client.get_object(
-            Bucket=ctx.config.bucket,
-            Key=tracking_key,
-        )
-        data = response["Body"].read()
-        logger.debug("Downloaded tracking DB from s3://%s/%s", ctx.config.bucket, tracking_key)
-        return data
-    except (NoCredentialsError, PartialCredentialsError) as e:
-        raise S3AuthError(f"AWS credentials error: {e}") from e
-    except ClientError as e:
-        error_code = e.response.get("Error", {}).get("Code", "")
-        if error_code in ("403", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
-            raise S3AuthError(f"S3 access denied: {e}") from e
-        if error_code == "NoSuchKey":
-            return None
-        logger.warning("Failed to download tracking for %s: %s", sftp_folder, e)
-        return None
 
 
 def delete_object(ctx: S3Context, s3_key: str) -> None:

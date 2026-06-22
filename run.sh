@@ -19,5 +19,5 @@ export PYTHONPATH="${SCRIPT_DIR}/vendor:${SCRIPT_DIR}/src${PYTHONPATH:+:${PYTHON
 
 exec python3 -m migrator \
     --config "${SCRIPT_DIR}/config.yaml" \
-    --folders "${SCRIPT_DIR}/folders.txt" \
+    --folders "${SCRIPT_DIR}/folders.yaml" \
     "$@"

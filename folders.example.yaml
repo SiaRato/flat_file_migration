@@ -1,0 +1,13 @@
+folders:
+  # Scheduled jobs
+  - source: /data/exports/2024
+    cron: "0 2 * * *"
+    target: my_s3_prefix/2024
+
+  - source: /data/reports
+    cron: "*/15 * * * *"
+    target: reports/daily
+
+  # One-time jobs (will run exactly once per daemon boot)
+  - source: /archive/logs
+    target: archive/logs

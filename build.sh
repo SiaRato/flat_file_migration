@@ -50,7 +50,7 @@ chmod +x "${BUNDLE_DIR}/run.sh"
 
 # Copy config templates
 cp "${SCRIPT_DIR}/config.example.yaml" "${BUNDLE_DIR}/config.example.yaml"
-cp "${SCRIPT_DIR}/folders.example.txt" "${BUNDLE_DIR}/folders.example.txt"
+cp "${SCRIPT_DIR}/folders.example.yaml" "${BUNDLE_DIR}/folders.example.yaml"
 
 # Copy README
 if [ -f "${SCRIPT_DIR}/README.md" ]; then
@@ -76,7 +76,7 @@ echo ""
 echo "Then on the midman server:"
 echo "  cd /opt/migrator"
 echo "  cp config.example.yaml config.yaml   # edit with your settings"
-echo "  cp folders.example.txt folders.txt    # edit with your folders"
+echo "  cp folders.example.yaml folders.yaml    # edit with your folders"
 echo "  export SFTP_PASSWORD=xxx"
 echo "  export AWS_ACCESS_KEY_ID=xxx"
 echo "  export AWS_SECRET_ACCESS_KEY=xxx"
